@@ -1,0 +1,5 @@
+**/bin
+**/obj
+src/NotifyCenter.Web/node_modules
+src/NotifyCenter.Web/dist
+.env

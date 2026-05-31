@@ -1,0 +1,41 @@
+:root {
+  color-scheme: light;
+  font-family: "Bahnschrift", "Segoe UI Variable", "Trebuchet MS", sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #151b23;
+  background:
+    radial-gradient(circle at top right, rgba(255, 196, 126, 0.35), transparent 24rem),
+    radial-gradient(circle at bottom left, rgba(64, 145, 108, 0.18), transparent 30rem),
+    linear-gradient(180deg, #f5efe2 0%, #f8f6f1 48%, #f0f3ec 100%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  min-width: 320px;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+a {
+  color: inherit;
+}
