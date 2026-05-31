@@ -1,0 +1,43 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: notifycenter-db
+    environment:
+      POSTGRES_DB: notify_center
+      POSTGRES_USER: notify
+      POSTGRES_PASSWORD: notify
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notify -d notify_center"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    container_name: notifycenter-api
+    environment:
+      ASPNETCORE_URLS: "${ASPNETCORE_URLS:-http://+:18100}"
+      DATABASE_URL: "${DATABASE_URL:-postgresql://notify:notify@db:5432/notify_center?schema=public}"
+      JWT_ISSUER: "${JWT_ISSUER:-NotifyCenter}"
+      JWT_AUDIENCE: "${JWT_AUDIENCE:-NotifyCenterClients}"
+      JWT_SIGNING_KEY: "${JWT_SIGNING_KEY:-change-me-to-a-32-character-secret}"
+      NOTIFICATION_ADMIN_PASSWORD: "${NOTIFICATION_ADMIN_PASSWORD:-}"
+      NOTIFICATION_POLL_SECONDS: "${NOTIFICATION_POLL_SECONDS:-30}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      TELEGRAM_DEFAULT_CHAT_ID: "${TELEGRAM_DEFAULT_CHAT_ID:-}"
+      TELEGRAM_PARSE_MODE: "${TELEGRAM_PARSE_MODE:-Markdown}"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "18100:18100"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+

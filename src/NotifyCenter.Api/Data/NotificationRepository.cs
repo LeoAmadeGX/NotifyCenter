@@ -1,0 +1,420 @@
+using Npgsql;
+using NpgsqlTypes;
+using NotifyCenter.Api.Models;
+
+namespace NotifyCenter.Api.Data;
+
+public sealed class NotificationRepository(NpgsqlDataSource dataSource)
+{
+    private const string InsertSql = """
+        INSERT INTO notification_items (
+            id, dedupe_key, source_system, event_type, channel, target, title, body,
+            scheduled_at_utc, status, metadata
+        )
+        VALUES (
+            @id, @dedupe_key, @source_system, @event_type, @channel, @target, @title, @body,
+            @scheduled_at_utc, 'pending', @metadata
+        )
+        ON CONFLICT (dedupe_key) DO NOTHING
+        RETURNING id;
+        """;
+
+    private const string UpdateSql = """
+        UPDATE notification_items
+        SET source_system = @source_system,
+            event_type = @event_type,
+            channel = @channel,
+            target = @target,
+            title = @title,
+            body = @body,
+            scheduled_at_utc = @scheduled_at_utc,
+            metadata = @metadata,
+            last_error = NULL,
+            status = CASE WHEN status = 'failed' THEN 'pending' ELSE status END,
+            updated_at = now()
+        WHERE dedupe_key = @dedupe_key
+          AND status NOT IN ('sent', 'canceled')
+        RETURNING id, status;
+        """;
+
+    private const string ItemColumns = """
+        id,
+        dedupe_key,
+        source_system,
+        event_type,
+        channel,
+        target,
+        title,
+        body,
+        scheduled_at_utc,
+        status,
+        metadata::text AS metadata_json,
+        last_error,
+        created_at,
+        updated_at,
+        sent_at_utc,
+        canceled_at_utc
+        """;
+
+    public async Task<UpsertResult> UpsertAsync(NotificationUpsert item, CancellationToken cancellationToken)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        return await UpsertAsync(item, connection, null, cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<UpsertResult>> UpsertManyAsync(
+        IReadOnlyList<NotificationUpsert> items,
+        CancellationToken cancellationToken)
+    {
+        if (items.Count == 0)
+        {
+            return [];
+        }
+
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        var results = new List<UpsertResult>(items.Count);
+
+        foreach (var item in items)
+        {
+            results.Add(await UpsertAsync(item, connection, transaction, cancellationToken));
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+        return results;
+    }
+
+    public async Task<IReadOnlyList<NotificationItem>> ListAsync(string? status, int limit, CancellationToken cancellationToken)
+    {
+        var sql = $"""
+            SELECT {ItemColumns}
+            FROM notification_items
+            {(string.IsNullOrWhiteSpace(status) ? string.Empty : "WHERE status = @status")}
+            ORDER BY scheduled_at_utc DESC
+            LIMIT @limit;
+            """;
+
+        await using var command = dataSource.CreateCommand(sql);
+        command.Parameters.AddWithValue("limit", Math.Clamp(limit, 1, 500));
+        if (!string.IsNullOrWhiteSpace(status))
+        {
+            command.Parameters.AddWithValue("status", status);
+        }
+
+        return await ReadItemsAsync(command, cancellationToken);
+    }
+
+    public async Task<NotificationItem?> GetByIdAsync(Guid id, CancellationToken cancellationToken)
+    {
+        var sql = $"""
+            SELECT {ItemColumns}
+            FROM notification_items
+            WHERE id = @id;
+            """;
+
+        await using var command = dataSource.CreateCommand(sql);
+        command.Parameters.AddWithValue("id", id);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadItem(reader) : null;
+    }
+
+    public async Task<IReadOnlyList<NotificationAttempt>> GetAttemptsAsync(Guid notificationId, CancellationToken cancellationToken)
+    {
+        const string sql = """
+            SELECT id, notification_id, attempted_at_utc, status, http_status, response_body, error
+            FROM notification_attempts
+            WHERE notification_id = @notification_id
+            ORDER BY attempted_at_utc DESC;
+            """;
+
+        await using var command = dataSource.CreateCommand(sql);
+        command.Parameters.AddWithValue("notification_id", notificationId);
+        var attempts = new List<NotificationAttempt>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            attempts.Add(ReadAttempt(reader));
+        }
+
+        return attempts;
+    }
+
+    public async Task<IReadOnlyList<NotificationItem>> GetDuePendingAsync(
+        DateTimeOffset nowUtc,
+        int limit,
+        CancellationToken cancellationToken)
+    {
+        var sql = $"""
+            SELECT {ItemColumns}
+            FROM notification_items
+            WHERE status = 'pending'
+              AND scheduled_at_utc <= @now_utc
+            ORDER BY scheduled_at_utc ASC
+            LIMIT @limit;
+            """;
+
+        await using var command = dataSource.CreateCommand(sql);
+        command.Parameters.AddWithValue("now_utc", nowUtc.UtcDateTime);
+        command.Parameters.AddWithValue("limit", Math.Clamp(limit, 1, 100));
+        return await ReadItemsAsync(command, cancellationToken);
+    }
+
+    public async Task MarkSentAsync(Guid notificationId, int httpStatus, string responseBody, CancellationToken cancellationToken)
+    {
+        await AddAttemptAsync(notificationId, "sent", httpStatus, responseBody, null, cancellationToken);
+
+        const string sql = """
+            UPDATE notification_items
+            SET status = 'sent',
+                sent_at_utc = now(),
+                last_error = NULL,
+                updated_at = now()
+            WHERE id = @id;
+            """;
+
+        await using var command = dataSource.CreateCommand(sql);
+        command.Parameters.AddWithValue("id", notificationId);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task MarkFailedAsync(
+        Guid notificationId,
+        int? httpStatus,
+        string? responseBody,
+        string error,
+        CancellationToken cancellationToken)
+    {
+        await AddAttemptAsync(notificationId, "failed", httpStatus, responseBody, error, cancellationToken);
+
+        const string sql = """
+            UPDATE notification_items
+            SET status = 'failed',
+                last_error = @error,
+                updated_at = now()
+            WHERE id = @id
+              AND status <> 'canceled';
+            """;
+
+        await using var command = dataSource.CreateCommand(sql);
+        command.Parameters.AddWithValue("id", notificationId);
+        command.Parameters.AddWithValue("error", error);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<bool> CancelAsync(Guid notificationId, CancellationToken cancellationToken)
+    {
+        const string sql = """
+            UPDATE notification_items
+            SET status = 'canceled',
+                canceled_at_utc = now(),
+                updated_at = now()
+            WHERE id = @id
+              AND status IN ('pending', 'failed')
+            RETURNING id;
+            """;
+
+        await using var command = dataSource.CreateCommand(sql);
+        command.Parameters.AddWithValue("id", notificationId);
+        return await command.ExecuteScalarAsync(cancellationToken) is Guid;
+    }
+
+    public async Task<bool> RetryAsync(Guid notificationId, CancellationToken cancellationToken)
+    {
+        const string sql = """
+            UPDATE notification_items
+            SET status = 'pending',
+                scheduled_at_utc = now(),
+                last_error = NULL,
+                updated_at = now()
+            WHERE id = @id
+              AND status = 'failed'
+            RETURNING id;
+            """;
+
+        await using var command = dataSource.CreateCommand(sql);
+        command.Parameters.AddWithValue("id", notificationId);
+        return await command.ExecuteScalarAsync(cancellationToken) is Guid;
+    }
+
+    private async Task<UpsertResult> UpsertAsync(
+        NotificationUpsert item,
+        NpgsqlConnection connection,
+        NpgsqlTransaction? transaction,
+        CancellationToken cancellationToken)
+    {
+        var id = Guid.NewGuid();
+        await using (var insert = CreateCommand(connection, transaction, InsertSql))
+        {
+            insert.Parameters.AddWithValue("id", id);
+            AddUpsertParameters(insert, item);
+            var inserted = await insert.ExecuteScalarAsync(cancellationToken);
+            if (inserted is Guid insertedId)
+            {
+                return new UpsertResult(insertedId, item.DedupeKey, "created", "pending");
+            }
+        }
+
+        await using (var update = CreateCommand(connection, transaction, UpdateSql))
+        {
+            AddUpsertParameters(update, item);
+            await using var reader = await update.ExecuteReaderAsync(cancellationToken);
+            if (await reader.ReadAsync(cancellationToken))
+            {
+                return new UpsertResult(reader.GetGuid(0), item.DedupeKey, "updated", reader.GetString(1));
+            }
+        }
+
+        var existing = await GetByDedupeKeyAsync(item.DedupeKey, connection, transaction, cancellationToken);
+        if (existing is null)
+        {
+            throw new InvalidOperationException("Notification upsert conflict could not be resolved");
+        }
+
+        return new UpsertResult(existing.Id, item.DedupeKey, "skipped", existing.Status);
+    }
+
+    private async Task<NotificationItem?> GetByDedupeKeyAsync(
+        string dedupeKey,
+        NpgsqlConnection connection,
+        NpgsqlTransaction? transaction,
+        CancellationToken cancellationToken)
+    {
+        var sql = $"""
+            SELECT {ItemColumns}
+            FROM notification_items
+            WHERE dedupe_key = @dedupe_key;
+            """;
+
+        await using var command = CreateCommand(connection, transaction, sql);
+        command.Parameters.AddWithValue("dedupe_key", dedupeKey);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadItem(reader) : null;
+    }
+
+    private static NpgsqlCommand CreateCommand(
+        NpgsqlConnection connection,
+        NpgsqlTransaction? transaction,
+        string sql)
+    {
+        var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.Transaction = transaction;
+        return command;
+    }
+
+    private static void AddUpsertParameters(NpgsqlCommand command, NotificationUpsert item)
+    {
+        command.Parameters.AddWithValue("dedupe_key", item.DedupeKey);
+        command.Parameters.AddWithValue("source_system", item.SourceSystem);
+        command.Parameters.AddWithValue("event_type", item.EventType);
+        command.Parameters.AddWithValue("channel", item.Channel);
+        command.Parameters.AddWithValue("target", item.Target);
+        command.Parameters.AddWithValue("title", item.Title);
+        command.Parameters.AddWithValue("body", item.Body);
+        command.Parameters.AddWithValue("scheduled_at_utc", item.ScheduledAtUtc.UtcDateTime);
+        command.Parameters.Add("metadata", NpgsqlDbType.Jsonb).Value = item.MetadataJson;
+    }
+
+    private async Task AddAttemptAsync(
+        Guid notificationId,
+        string status,
+        int? httpStatus,
+        string? responseBody,
+        string? error,
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            INSERT INTO notification_attempts (
+                id, notification_id, attempted_at_utc, status, http_status, response_body, error
+            )
+            VALUES (
+                @id, @notification_id, now(), @status, @http_status, @response_body, @error
+            );
+            """;
+
+        await using var command = dataSource.CreateCommand(sql);
+        command.Parameters.AddWithValue("id", Guid.NewGuid());
+        command.Parameters.AddWithValue("notification_id", notificationId);
+        command.Parameters.AddWithValue("status", status);
+        command.Parameters.AddWithValue("http_status", (object?)httpStatus ?? DBNull.Value);
+        command.Parameters.AddWithValue("response_body", (object?)responseBody ?? DBNull.Value);
+        command.Parameters.AddWithValue("error", (object?)error ?? DBNull.Value);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task<IReadOnlyList<NotificationItem>> ReadItemsAsync(
+        NpgsqlCommand command,
+        CancellationToken cancellationToken)
+    {
+        var items = new List<NotificationItem>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            items.Add(ReadItem(reader));
+        }
+
+        return items;
+    }
+
+    private static NotificationItem ReadItem(NpgsqlDataReader reader)
+    {
+        return new NotificationItem(
+            reader.GetGuid(reader.GetOrdinal("id")),
+            reader.GetString(reader.GetOrdinal("dedupe_key")),
+            reader.GetString(reader.GetOrdinal("source_system")),
+            reader.GetString(reader.GetOrdinal("event_type")),
+            reader.GetString(reader.GetOrdinal("channel")),
+            reader.GetString(reader.GetOrdinal("target")),
+            reader.GetString(reader.GetOrdinal("title")),
+            reader.GetString(reader.GetOrdinal("body")),
+            ReadTimestamp(reader, "scheduled_at_utc")!.Value,
+            reader.GetString(reader.GetOrdinal("status")),
+            reader.GetString(reader.GetOrdinal("metadata_json")),
+            ReadNullableString(reader, "last_error"),
+            ReadTimestamp(reader, "created_at")!.Value,
+            ReadTimestamp(reader, "updated_at")!.Value,
+            ReadTimestamp(reader, "sent_at_utc"),
+            ReadTimestamp(reader, "canceled_at_utc"));
+    }
+
+    private static NotificationAttempt ReadAttempt(NpgsqlDataReader reader)
+    {
+        return new NotificationAttempt(
+            reader.GetGuid(reader.GetOrdinal("id")),
+            reader.GetGuid(reader.GetOrdinal("notification_id")),
+            ReadTimestamp(reader, "attempted_at_utc")!.Value,
+            reader.GetString(reader.GetOrdinal("status")),
+            ReadNullableInt(reader, "http_status"),
+            ReadNullableString(reader, "response_body"),
+            ReadNullableString(reader, "error"));
+    }
+
+    private static string? ReadNullableString(NpgsqlDataReader reader, string name)
+    {
+        var ordinal = reader.GetOrdinal(name);
+        return reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
+    }
+
+    private static int? ReadNullableInt(NpgsqlDataReader reader, string name)
+    {
+        var ordinal = reader.GetOrdinal(name);
+        return reader.IsDBNull(ordinal) ? null : reader.GetInt32(ordinal);
+    }
+
+    private static DateTimeOffset? ReadTimestamp(NpgsqlDataReader reader, string name)
+    {
+        var ordinal = reader.GetOrdinal(name);
+        if (reader.IsDBNull(ordinal))
+        {
+            return null;
+        }
+
+        var value = reader.GetFieldValue<DateTime>(ordinal);
+        if (value.Kind == DateTimeKind.Unspecified)
+        {
+            value = DateTime.SpecifyKind(value, DateTimeKind.Utc);
+        }
+
+        return new DateTimeOffset(value.ToUniversalTime());
+    }
+}
