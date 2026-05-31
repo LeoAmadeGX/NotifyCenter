@@ -3,7 +3,7 @@
 NotifyCenter 是一個以 `.NET 10 + PostgreSQL + Vue 3` 建立的通知排程與派送中心。
 目前正式支援的通知渠道只有 `Telegram`，但 API 契約保持通用，之後可以繼續擴充其他渠道。
 
-## 目前功能
+## 目前功能 v1.0.0
 
 - 接收單筆通知與批次通知請求
 - 使用 JWT 驗證外部 producer 權限
@@ -185,3 +185,8 @@ Admin cookie session 也具備 `notifications.admin` 權限，因此管理台可
 - 目前正式通知渠道只有 `Telegram`
 - 本倉庫尚未提供多管理員、忘記密碼、帳號改名功能
 - 目前這台開發環境沒有 Docker CLI，且僅安裝 `.NET SDK 9.0.314`；若要實際 build / 跑整合測試，請在有 Docker 與 `.NET 10 SDK` 的環境執行
+
+
+## 版本變更紀錄
+
+- 初版上線，僅有 Telegram 機器人通知

@@ -772,8 +772,8 @@ function toMessage(error: unknown) {
       <header class="topbar">
         <div>
           <p class="eyebrow">NotifyCenter Console</p>
-          <h1>通知隊列</h1>
-          <p class="subtitle">以清單為主、以操作為先，明細與進階欄位退到右側。</p>
+          <h1>個人化通知中心</h1>
+          <p class="subtitle">負責提醒通知的小玩具。</p>
         </div>
         <div class="topbar__actions">
           <button class="button button--ghost button--compact" @click="loadDashboard" :disabled="loading || saving">
