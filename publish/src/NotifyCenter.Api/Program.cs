@@ -1,5 +1,7 @@
 using System.Text.Json;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using Npgsql;
 using NotifyCenter.Api.Auth;
 using NotifyCenter.Api.Configuration;
@@ -9,6 +11,7 @@ using NotifyCenter.Api.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 var options = AppOptions.Load(builder.Configuration);
+var lineWebhookJsonOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 
 builder.Services.AddSingleton(options);
 builder.Services.AddSingleton<NpgsqlDataSource>(_ => NpgsqlDataSource.Create(options.DatabaseConnectionString));
@@ -16,11 +19,13 @@ builder.Services.AddSingleton<NotificationDatabase>();
 builder.Services.AddSingleton<NotificationRepository>();
 builder.Services.AddSingleton<NotificationDeliveryRepository>();
 builder.Services.AddSingleton<RoutingTargetRepository>();
+builder.Services.AddSingleton<LineSourceRepository>();
 builder.Services.AddSingleton<AdminUserRepository>();
 builder.Services.AddSingleton<PasswordHasher>();
 builder.Services.AddSingleton<JwtTokenService>();
 builder.Services.AddSingleton<AdminSessionService>();
 builder.Services.AddHttpClient<TelegramSender>();
+builder.Services.AddHttpClient<LineSender>();
 builder.Services.AddSingleton<NotificationSenderRegistry>();
 builder.Services.AddSingleton<AdminDashboardEventBroadcaster>();
 builder.Services.AddHostedService<NotificationDispatcher>();
@@ -64,6 +69,45 @@ app.MapGet("/health", () => Results.Ok(new
     status = "ok",
     time = DateTimeOffset.UtcNow
 }));
+
+app.MapPost("/api/line/webhook", async (
+    HttpContext context,
+    AppOptions appOptions,
+    LineSourceRepository repository,
+    AdminDashboardEventBroadcaster eventBroadcaster,
+    CancellationToken cancellationToken) =>
+{
+    using var reader = new StreamReader(context.Request.Body, Encoding.UTF8);
+    var body = await reader.ReadToEndAsync(cancellationToken);
+
+    if (!HasValidLineSignature(body, context.Request.Headers["X-Line-Signature"].ToString(), appOptions.Line.ChannelSecret))
+    {
+        return Results.Json(new { error = "Invalid LINE webhook signature" }, statusCode: StatusCodes.Status401Unauthorized);
+    }
+
+    LineWebhookPayload? payload;
+    try
+    {
+        payload = JsonSerializer.Deserialize<LineWebhookPayload>(body, lineWebhookJsonOptions);
+    }
+    catch (JsonException)
+    {
+        return Results.BadRequest(new { error = "Invalid LINE webhook JSON payload" });
+    }
+
+    if (payload?.Events is null)
+    {
+        return Results.BadRequest(new { error = "LINE webhook events are required" });
+    }
+
+    var result = await repository.UpsertFromWebhookAsync(payload, cancellationToken);
+    if (result.StoredSources > 0)
+    {
+        eventBroadcaster.Publish("line_sources_changed", null, "line");
+    }
+
+    return Results.Ok(result);
+});
 
 app.MapPost("/api/admin/login", async (
     AdminLoginRequest request,
@@ -535,6 +579,20 @@ app.MapDelete("/api/routing-targets/{id:guid}", async (
     return Results.NoContent();
 });
 
+app.MapGet("/api/line-sources", async (
+    HttpContext context,
+    LineSourceRepository repository,
+    CancellationToken cancellationToken) =>
+{
+    if (RequireScope(context, "notifications.admin") is { } forbidden)
+    {
+        return forbidden;
+    }
+
+    var items = await repository.ListAsync(cancellationToken);
+    return Results.Ok(new { items });
+});
+
 app.MapGet("/api/admin/events", async (
     HttpContext context,
     AdminDashboardEventBroadcaster eventBroadcaster,
@@ -674,6 +732,25 @@ static async Task WriteJsonError(HttpContext context, int statusCode, string err
     await context.Response.WriteAsync(JsonSerializer.Serialize(new { error }));
 }
 
+static bool HasValidLineSignature(string requestBody, string signature, string? channelSecret)
+{
+    if (string.IsNullOrWhiteSpace(channelSecret))
+    {
+        return true;
+    }
+
+    if (string.IsNullOrWhiteSpace(signature))
+    {
+        return false;
+    }
+
+    using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(channelSecret));
+    var expectedSignature = Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(requestBody)));
+    return CryptographicOperations.FixedTimeEquals(
+        Encoding.UTF8.GetBytes(expectedSignature),
+        Encoding.UTF8.GetBytes(signature.Trim()));
+}
+
 static AdminSessionResponse ToAdminSessionResponse(AdminUser user, AppOptions appOptions)
 {
     return new AdminSessionResponse(
@@ -719,6 +796,7 @@ static bool IsProtectedApiPath(PathString path)
 {
     return path.StartsWithSegments("/api/notifications")
         || path.StartsWithSegments("/api/routing-targets")
+        || path.StartsWithSegments("/api/line-sources")
         || path.StartsWithSegments("/api/admin/events");
 }
 

@@ -30,7 +30,8 @@ services:
       - pgdata:/var/lib/postgresql/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -p 17053"]
+      test:
+        ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -p 17053"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -53,7 +54,9 @@ services:
       NOTIFICATION_POLL_SECONDS: "${NOTIFICATION_POLL_SECONDS:-30}"
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
       TELEGRAM_DEFAULT_CHAT_ID: "${TELEGRAM_DEFAULT_CHAT_ID:-}"
-      TELEGRAM_PARSE_MODE: "${TELEGRAM_PARSE_MODE:-Markdown}"
+      TELEGRAM_PARSE_MODE: "${TELEGRAM_PARSE_MODE:-HTML}"
+      LINE_CHANNEL_ACCESS_TOKEN: "${LINE_CHANNEL_ACCESS_TOKEN:-}"
+      LINE_CHANNEL_SECRET: "${LINE_CHANNEL_SECRET:-}"
     depends_on:
       db:
         condition: service_healthy
@@ -61,10 +64,10 @@ services:
       - "17052:17052"
     restart: unless-stopped
     networks:
-        notifycenter_internal:
-        app_shared:
-          aliases:
-            - notifycenter-api
+      notifycenter_internal:
+      app_shared:
+        aliases:
+          - notifycenter-api
 
 volumes:
   pgdata:

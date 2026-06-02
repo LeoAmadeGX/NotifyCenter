@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import {
   adminEventsUrl,
   cancelNotification,
@@ -10,6 +10,7 @@ import {
   deleteRoutingTarget,
   getAttempts,
   getFilterOptions,
+  getLineSources,
   getNotification,
   getNotifications,
   getRoutingTargets,
@@ -29,12 +30,14 @@ import type {
   NotificationFilters,
   NotificationItem,
   NotificationStats,
+  LineSourceItem,
   RoutingTargetInput,
   RoutingTargetItem,
   UpsertResult
 } from "./types";
 
-type SidePanel = "preview" | "create" | "batch" | "password" | "targets";
+type WorkspacePage = "notifications" | "targets";
+type SidePanel = "preview" | "create" | "batch" | "password";
 type SelectOption = { label: string; value: string };
 type DashboardEvent = {
   kind: string;
@@ -48,6 +51,7 @@ const saving = ref(false);
 const session = ref<AdminSession | null>(null);
 const errorMessage = ref("");
 const successMessage = ref("");
+const activePage = ref<WorkspacePage>("notifications");
 const sidePanel = ref<SidePanel>("preview");
 const notifications = ref<NotificationItem[]>([]);
 const attempts = ref<NotificationAttempt[]>([]);
@@ -57,7 +61,11 @@ const bulkResult = ref<BulkResult | null>(null);
 const selectedIds = ref<string[]>([]);
 const filterOptions = ref<NotificationFilterOptions>(getFallbackFilterOptions());
 const routingTargets = ref<RoutingTargetItem[]>([]);
+const lineSources = ref<LineSourceItem[]>([]);
 const advancedFiltersOpen = ref(false);
+const targetInputQuery = ref("");
+const targetDropdownOpen = ref(false);
+const targetPickedItem = ref<RoutingTargetItem | null>(null);
 
 const loginForm = reactive({
   username: "amadegx",
@@ -78,6 +86,7 @@ const filters = reactive<NotificationFilters>({
 const createForm = reactive({
   title: "",
   body: "",
+  channel: "telegram",
   target: "",
   dedupeKey: "",
   sourceSystem: "admin-ui",
@@ -154,7 +163,12 @@ const statusOptions = computed(() => [
   { label: "已略過", value: "skipped_no_target", count: stats.value?.skipped ?? 0 }
 ]);
 const channelOptions = computed(() =>
-  buildSelectOptions(filterOptions.value.channels, ["telegram"], filters.channel)
+  buildSelectOptions(filterOptions.value.channels, ["telegram", "line"], filters.channel)
+);
+const notificationChannelOptions = computed(() =>
+  uniqueSorted([...filterOptions.value.channels, "telegram", "line"])
+    .filter((channel) => channel === "telegram" || channel === "line")
+    .map((channel) => ({ label: channel, value: channel }))
 );
 const sourceSystemOptions = computed(() =>
   buildSelectOptions(filterOptions.value.sourceSystems, ["admin-ui", "manual"], filters.sourceSystem)
@@ -202,9 +216,36 @@ const routingTargetHint = computed(() => {
     case "teams":
       return "Teams 目前先管理對象設定，這一輪還沒有實際 sender。";
     case "line":
-      return "Line 目前先管理對象設定，這一輪還沒有實際 sender。";
+      return "LINE_CHANNEL_ACCESS_TOKEN 由 .env 提供；下方 webhook 收集到的 userId、groupId 或 roomId 可以直接帶入這裡。";
     default:
       return "";
+  }
+});
+const lineWebhookUrl = computed(() => {
+  const basePath = import.meta.env.BASE_URL.replace(/\/$/, "");
+  return `${window.location.origin}${basePath}/api/line/webhook`;
+});
+const lineSourceCounts = computed(() => ({
+  total: lineSources.value.length,
+  groups: lineSources.value.filter((source) => source.sourceType === "group").length,
+  rooms: lineSources.value.filter((source) => source.sourceType === "room").length,
+  users: lineSources.value.filter((source) => source.sourceType === "user").length
+}));
+
+const targetSuggestions = computed(() => {
+  const channel = createForm.channel;
+  const q = targetInputQuery.value.toLowerCase().trim();
+  return routingTargets.value.filter(
+    (t) =>
+      t.channel === channel &&
+      t.isEnabled &&
+      (q === "" || t.name.toLowerCase().includes(q) || t.destination.toLowerCase().includes(q))
+  );
+});
+
+watch(() => createForm.channel, () => {
+  if (targetPickedItem.value && targetPickedItem.value.channel !== createForm.channel) {
+    targetPickedItem.value = null;
   }
 });
 
@@ -234,6 +275,7 @@ async function restoreSession() {
     await loadDashboard({
       refreshFilters: true,
       refreshTargets: true,
+      refreshLineSources: true,
       syncPreview: true
     });
     startAutoRefresh();
@@ -260,6 +302,7 @@ async function handleLogin() {
     await loadDashboard({
       refreshFilters: true,
       refreshTargets: true,
+      refreshLineSources: true,
       syncPreview: true
     });
     startAutoRefresh();
@@ -288,6 +331,8 @@ async function handleLogout() {
     selectedIds.value = [];
     bulkResult.value = null;
     routingTargets.value = [];
+    lineSources.value = [];
+    activePage.value = "notifications";
     sidePanel.value = "preview";
     filterOptions.value = getFallbackFilterOptions();
     resetCreateForm();
@@ -307,8 +352,9 @@ async function runManualRefresh() {
   try {
     await loadDashboard({
       refreshFilters: true,
-      refreshTargets: sidePanel.value === "targets",
-      syncPreview: sidePanel.value === "preview"
+      refreshTargets: activePage.value === "targets",
+      refreshLineSources: activePage.value === "targets",
+      syncPreview: activePage.value === "notifications" && sidePanel.value === "preview"
     });
   } catch (error) {
     errorMessage.value = toMessage(error);
@@ -320,6 +366,7 @@ async function runManualRefresh() {
 async function loadDashboard(options?: {
   refreshFilters?: boolean;
   refreshTargets?: boolean;
+  refreshLineSources?: boolean;
   syncPreview?: boolean;
 }) {
   const tasks: Promise<unknown>[] = [loadStats(), loadNotifications()];
@@ -329,10 +376,13 @@ async function loadDashboard(options?: {
   if (options?.refreshTargets) {
     tasks.push(loadRoutingTargets());
   }
+  if (options?.refreshLineSources) {
+    tasks.push(loadLineSources());
+  }
 
   await Promise.all(tasks);
 
-  if (options?.syncPreview && sidePanel.value === "preview") {
+  if (options?.syncPreview && activePage.value === "notifications" && sidePanel.value === "preview") {
     await refreshSelectedPreview();
   }
 }
@@ -353,6 +403,15 @@ async function loadFilterOptions() {
 async function loadRoutingTargets() {
   const response = await getRoutingTargets();
   routingTargets.value = response.items;
+}
+
+async function loadLineSources() {
+  const response = await getLineSources();
+  lineSources.value = response.items;
+}
+
+async function loadTargetManagement() {
+  await Promise.all([loadRoutingTargets(), loadLineSources()]);
 }
 
 async function loadNotifications() {
@@ -383,7 +442,7 @@ async function refreshSummaryAndList(options?: { syncPreview?: boolean }) {
   try {
     await Promise.all([loadStats(), loadNotifications()]);
 
-    if (options?.syncPreview && sidePanel.value === "preview") {
+    if (options?.syncPreview && activePage.value === "notifications" && sidePanel.value === "preview") {
       await refreshSelectedPreview();
     }
   } catch (error) {
@@ -438,12 +497,22 @@ function openEventStream() {
   eventSource.addEventListener("dashboard", (event) => {
     try {
       const payload = JSON.parse((event as MessageEvent<string>).data) as DashboardEvent;
+      if (payload.kind === "line_sources_changed") {
+        if (activePage.value === "targets") {
+          void loadTargetManagement().catch((error) => {
+            errorMessage.value = toMessage(error);
+          });
+        }
+        return;
+      }
+
       const shouldSyncPreview =
+        activePage.value === "notifications" &&
         sidePanel.value === "preview" &&
         (!payload.deliveryId || payload.deliveryId === selectedNotification.value?.id);
       queuePassiveRefresh(shouldSyncPreview);
     } catch {
-      queuePassiveRefresh(sidePanel.value === "preview");
+      queuePassiveRefresh(activePage.value === "notifications" && sidePanel.value === "preview");
     }
   });
   eventSource.onerror = () => {
@@ -475,6 +544,13 @@ function queuePassiveRefresh(syncPreview: boolean) {
 
 function handleVisibilityChange() {
   if (!document.hidden && session.value) {
+    if (activePage.value === "targets") {
+      void loadTargetManagement().catch((error) => {
+        errorMessage.value = toMessage(error);
+      });
+      return;
+    }
+
     queuePassiveRefresh(sidePanel.value === "preview");
   }
 }
@@ -509,20 +585,28 @@ function toggleAdvancedFilters() {
 }
 
 function openCreatePanel() {
+  activePage.value = "notifications";
+  createForm.scheduledAtLocal = createDefaultSchedule();
   sidePanel.value = "create";
 }
 
 function openBatchPanel() {
+  activePage.value = "notifications";
   sidePanel.value = "batch";
 }
 
 function openPasswordPanel() {
+  activePage.value = "notifications";
   sidePanel.value = "password";
 }
 
-async function openTargetsPanel() {
-  sidePanel.value = "targets";
-  await loadRoutingTargets();
+function openNotificationsPage() {
+  activePage.value = "notifications";
+}
+
+async function openTargetsPage() {
+  activePage.value = "targets";
+  await loadTargetManagement();
 }
 
 function clearSelection() {
@@ -573,6 +657,7 @@ function toggleSelectAllVisible() {
 }
 
 async function selectNotification(id: string, focusPreview = true) {
+  activePage.value = "notifications";
   const item = notifications.value.find((candidate) => candidate.id === id);
   if (item) {
     selectedNotification.value = item;
@@ -635,6 +720,15 @@ function useSelectedAsDraft() {
   createForm.target = selectedNotification.value.isTargetOverride
     ? selectedNotification.value.target ?? ""
     : "";
+  const destValue = createForm.target;
+  const matchedTarget = routingTargets.value.find((t) => t.destination === destValue && t.channel === selectedNotification.value!.channel);
+  if (matchedTarget) {
+    targetPickedItem.value = matchedTarget;
+    targetInputQuery.value = matchedTarget.name;
+  } else {
+    targetPickedItem.value = null;
+    targetInputQuery.value = destValue;
+  }
   createForm.sourceSystem = selectedNotification.value.sourceSystem || "admin-ui";
   createForm.eventType = selectedNotification.value.eventType || "manual.notification";
   createForm.dedupeKey = "";
@@ -751,6 +845,7 @@ async function performRetry(id: string) {
 }
 
 function startEditingRoutingTarget(item: RoutingTargetItem) {
+  activePage.value = "targets";
   routingTargetForm.id = item.id;
   routingTargetForm.channel = item.channel;
   routingTargetForm.name = item.name;
@@ -758,7 +853,6 @@ function startEditingRoutingTarget(item: RoutingTargetItem) {
   routingTargetForm.isEnabled = item.isEnabled;
   routingTargetForm.sortOrder = item.sortOrder;
   routingTargetForm.metadataJson = formatJson(item.metadataJson);
-  sidePanel.value = "targets";
 }
 
 function resetRoutingTargetForm() {
@@ -789,7 +883,8 @@ async function submitRoutingTarget() {
     resetRoutingTargetForm();
     await Promise.all([
       loadRoutingTargets(),
-      refreshSummaryAndList({ syncPreview: sidePanel.value === "preview" })
+      loadLineSources(),
+      refreshSummaryAndList({ syncPreview: activePage.value === "notifications" && sidePanel.value === "preview" })
     ]);
   } catch (error) {
     errorMessage.value = toMessage(error);
@@ -811,7 +906,8 @@ async function removeRoutingTarget(id: string) {
     successMessage.value = "對象設定已刪除。";
     await Promise.all([
       loadRoutingTargets(),
-      refreshSummaryAndList({ syncPreview: sidePanel.value === "preview" })
+      loadLineSources(),
+      refreshSummaryAndList({ syncPreview: activePage.value === "notifications" && sidePanel.value === "preview" })
     ]);
   } catch (error) {
     errorMessage.value = toMessage(error);
@@ -825,7 +921,7 @@ function buildCreatePayload(): NotificationCreateInput {
     dedupeKey: createForm.dedupeKey || null,
     sourceSystem: createForm.sourceSystem || null,
     eventType: createForm.eventType || null,
-    channel: "telegram",
+    channel: createForm.channel,
     target: createForm.target.trim() || null,
     title: createForm.title,
     body: createForm.body,
@@ -858,12 +954,30 @@ function applySessionDefaults(currentSession: AdminSession | null, force: boolea
 function resetCreateForm() {
   createForm.title = "";
   createForm.body = "";
+  createForm.channel = "telegram";
   createForm.target = "";
   createForm.dedupeKey = "";
   createForm.sourceSystem = "admin-ui";
   createForm.eventType = "manual.notification";
   createForm.scheduledAtLocal = createDefaultSchedule();
   createForm.metadataJson = "";
+  targetInputQuery.value = "";
+  targetPickedItem.value = null;
+  targetDropdownOpen.value = false;
+}
+
+function onTargetInput(val: string) {
+  targetInputQuery.value = val;
+  targetPickedItem.value = null;
+  createForm.target = val;
+  targetDropdownOpen.value = true;
+}
+
+function pickTarget(item: RoutingTargetItem) {
+  targetPickedItem.value = item;
+  targetInputQuery.value = item.name;
+  createForm.target = item.destination;
+  targetDropdownOpen.value = false;
 }
 
 function resetBatchPayload(force: boolean) {
@@ -1044,7 +1158,7 @@ function normalizeFilterOptions(options: NotificationFilterOptions): Notificatio
 
 function getFallbackFilterOptions(): NotificationFilterOptions {
   return {
-    channels: ["telegram"],
+    channels: ["telegram", "line"],
     sourceSystems: ["admin-ui", "manual"],
     eventTypes: ["manual.batch", "manual.notification"]
   };
@@ -1099,6 +1213,62 @@ function targetDescription(item: NotificationItem) {
   return "NotifyCenter 路由";
 }
 
+function useLineSourceAsRoutingTarget(source: LineSourceItem) {
+  activePage.value = "targets";
+  routingTargetForm.id = "";
+  routingTargetForm.channel = "line";
+  routingTargetForm.name = source.displayName || `${sourceTypeLabel(source.sourceType)} ${shortId(source.sourceId)}`;
+  routingTargetForm.destination = source.sourceId;
+  routingTargetForm.isEnabled = true;
+  routingTargetForm.sortOrder = nextRoutingSortOrder("line");
+  routingTargetForm.metadataJson = JSON.stringify(
+    {
+      lineSourceId: source.id,
+      lineSourceType: source.sourceType
+    },
+    null,
+    2
+  );
+}
+
+function nextRoutingSortOrder(channel: string) {
+  const currentMax = routingTargets.value
+    .filter((target) => target.channel === channel)
+    .reduce((max, target) => Math.max(max, target.sortOrder), 0);
+  return currentMax + 10;
+}
+
+function sourceTypeLabel(sourceType: string) {
+  switch (sourceType) {
+    case "group":
+      return "群組";
+    case "room":
+      return "聊天室";
+    case "user":
+      return "使用者";
+    default:
+      return sourceType;
+  }
+}
+
+function lineSourceTitle(source: LineSourceItem) {
+  return source.displayName || `${sourceTypeLabel(source.sourceType)} ${shortId(source.sourceId)}`;
+}
+
+function lineSourceRoutingText(source: LineSourceItem) {
+  if (!source.routingTargetName) {
+    return "尚未加入派送對象";
+  }
+
+  return source.routingTargetEnabled
+    ? `已加入：${source.routingTargetName}`
+    : `已加入但停用：${source.routingTargetName}`;
+}
+
+function shortId(value: string) {
+  return value.length > 14 ? `${value.slice(0, 7)}…${value.slice(-5)}` : value;
+}
+
 function toMessage(error: unknown) {
   return error instanceof Error ? error.message : "發生未預期錯誤。";
 }
@@ -1145,8 +1315,15 @@ function toMessage(error: unknown) {
           </button>
           <button
             class="button button--ghost button--compact"
-            :class="{ 'button--selected': sidePanel === 'targets' }"
-            @click="openTargetsPanel"
+            :class="{ 'button--selected': activePage === 'notifications' }"
+            @click="openNotificationsPage"
+          >
+            通知管理
+          </button>
+          <button
+            class="button button--ghost button--compact"
+            :class="{ 'button--selected': activePage === 'targets' }"
+            @click="openTargetsPage"
           >
             對象管理
           </button>
@@ -1197,7 +1374,7 @@ function toMessage(error: unknown) {
         </article>
       </section>
 
-      <section class="dashboard">
+      <section v-if="activePage === 'notifications'" class="dashboard">
         <section class="panel queue-panel">
           <div class="panel__header">
             <div>
@@ -1545,7 +1722,11 @@ function toMessage(error: unknown) {
                 </label>
                 <label>
                   <span>頻道</span>
-                  <input value="telegram" disabled />
+                  <select v-model="createForm.channel">
+                    <option v-for="option in notificationChannelOptions" :key="option.value" :value="option.value">
+                      {{ option.label }}
+                    </option>
+                  </select>
                 </label>
               </div>
 
@@ -1554,10 +1735,28 @@ function toMessage(error: unknown) {
                 <div class="foldout__content stack">
                   <label>
                     <span>Target Override</span>
-                    <input
-                      v-model="createForm.target"
-                      placeholder="留空時，交由 NotifyCenter 的頻道對象設定決定實際派送對象"
-                    />
+                    <div class="target-ac">
+                      <input
+                        :value="targetInputQuery"
+                        @input="onTargetInput(($event.target as HTMLInputElement).value)"
+                        @focus="targetDropdownOpen = true"
+                        @blur="targetDropdownOpen = false"
+                        autocomplete="off"
+                        placeholder="留空時，交由 NotifyCenter 的頻道對象設定決定實際派送對象"
+                      />
+                      <ul v-if="targetDropdownOpen && targetSuggestions.length > 0" class="target-ac__dropdown">
+                        <li
+                          v-for="t in targetSuggestions"
+                          :key="t.id"
+                          class="target-ac__item"
+                          @mousedown.prevent="pickTarget(t)"
+                        >
+                          <span class="target-ac__name">{{ t.name }}</span>
+                          <small class="target-ac__dest">{{ t.destination }}</small>
+                        </li>
+                      </ul>
+                    </div>
+                    <p v-if="targetPickedItem" class="helper helper--picked">↳ {{ targetPickedItem.destination }}</p>
                   </label>
 
                   <div class="two-up">
@@ -1620,10 +1819,71 @@ function toMessage(error: unknown) {
             </article>
           </section>
 
-          <section v-else-if="sidePanel === 'targets'" class="panel targets-panel">
+          <section v-else class="panel">
             <div class="panel__header">
               <div>
-                <h2>對象管理</h2>
+                <h2>密碼設定</h2>
+              </div>
+              <button class="button button--ghost button--compact" @click="sidePanel = 'preview'">返回預覽</button>
+            </div>
+
+            <form class="stack" @submit.prevent="submitPasswordChange">
+              <label>
+                <span>目前密碼</span>
+                <input
+                  v-model="passwordForm.currentPassword"
+                  type="password"
+                  autocomplete="current-password"
+                />
+              </label>
+              <label>
+                <span>新密碼</span>
+                <input v-model="passwordForm.newPassword" type="password" autocomplete="new-password" />
+              </label>
+              <label>
+                <span>確認新密碼</span>
+                <input
+                  v-model="passwordForm.confirmPassword"
+                  type="password"
+                  autocomplete="new-password"
+                />
+              </label>
+              <button class="button button--primary" :disabled="saving">更新密碼</button>
+            </form>
+          </section>
+        </aside>
+      </section>
+
+      <section v-else class="targets-page">
+        <section class="panel targets-hero">
+          <div>
+            <p class="eyebrow">Routing Targets</p>
+            <h2>對象管理</h2>
+            <p class="subtitle">
+              LINE webhook 會先收集 userId、groupId 與 roomId；確認後再加入 routing targets，通知才會實際派送給該對象。
+            </p>
+          </div>
+          <div class="target-metrics">
+            <article>
+              <span>Routing targets</span>
+              <strong>{{ routingTargets.length }}</strong>
+            </article>
+            <article>
+              <span>LINE sources</span>
+              <strong>{{ lineSourceCounts.total }}</strong>
+            </article>
+            <article>
+              <span>群組 / 聊天室 / 使用者</span>
+              <strong>{{ lineSourceCounts.groups }} / {{ lineSourceCounts.rooms }} / {{ lineSourceCounts.users }}</strong>
+            </article>
+          </div>
+        </section>
+
+        <section class="targets-grid">
+          <section class="panel targets-panel">
+            <div class="panel__header">
+              <div>
+                <h2>{{ routingTargetForm.id ? "編輯派送對象" : "新增派送對象" }}</h2>
               </div>
               <button class="button button--ghost button--compact" @click="resetRoutingTargetForm">清空表單</button>
             </div>
@@ -1667,7 +1927,7 @@ function toMessage(error: unknown) {
                 <textarea
                   v-model="routingTargetForm.metadataJson"
                   rows="4"
-                  placeholder='例如：{"team":"ops","note":"future Teams webhook"}'
+                  placeholder='例如：{"team":"ops","note":"line group"}'
                 ></textarea>
               </label>
 
@@ -1698,42 +1958,69 @@ function toMessage(error: unknown) {
                   </button>
                 </div>
               </article>
+
+              <div v-if="routingTargets.length === 0" class="empty-state">
+                <p>尚未設定派送對象。可以手動新增，或從右側 LINE webhook 來源帶入。</p>
+              </div>
             </div>
           </section>
 
-          <section v-else class="panel">
+          <section class="panel line-sources-panel">
             <div class="panel__header">
               <div>
-                <h2>密碼設定</h2>
+                <h2>LINE webhook 來源</h2>
+                <p class="helper">將這個網址設定到 LINE Developers 的 Webhook URL，使用者或群組互動後就會出現在下方。</p>
               </div>
-              <button class="button button--ghost button--compact" @click="sidePanel = 'preview'">返回預覽</button>
+              <button class="button button--ghost button--compact" @click="loadTargetManagement" :disabled="loading || saving">
+                重新載入來源
+              </button>
             </div>
 
-            <form class="stack" @submit.prevent="submitPasswordChange">
-              <label>
-                <span>目前密碼</span>
-                <input
-                  v-model="passwordForm.currentPassword"
-                  type="password"
-                  autocomplete="current-password"
-                />
-              </label>
-              <label>
-                <span>新密碼</span>
-                <input v-model="passwordForm.newPassword" type="password" autocomplete="new-password" />
-              </label>
-              <label>
-                <span>確認新密碼</span>
-                <input
-                  v-model="passwordForm.confirmPassword"
-                  type="password"
-                  autocomplete="new-password"
-                />
-              </label>
-              <button class="button button--primary" :disabled="saving">更新密碼</button>
-            </form>
+            <label>
+              <span>Webhook URL</span>
+              <input class="mono" :value="lineWebhookUrl" readonly />
+            </label>
+
+            <div class="source-list">
+              <article v-for="source in lineSources" :key="source.id" class="source-card">
+                <div class="source-card__head">
+                  <div>
+                    <span class="badge badge--line-source">{{ sourceTypeLabel(source.sourceType) }}</span>
+                    <strong>{{ lineSourceTitle(source) }}</strong>
+                  </div>
+                  <span
+                    class="badge"
+                    :class="
+                      source.routingTargetName
+                        ? source.routingTargetEnabled
+                          ? 'badge--sent'
+                          : 'badge--canceled'
+                        : 'badge--pending_no_target'
+                    "
+                  >
+                    {{ lineSourceRoutingText(source) }}
+                  </span>
+                </div>
+
+                <p class="source-card__id mono">{{ source.sourceId }}</p>
+                <p class="helper">
+                  最後事件 {{ source.lastEventType || "—" }} ·
+                  {{ formatDate(source.lastEventAtUtc) }} · 首次看到 {{ formatDate(source.firstSeenAtUtc) }}
+                </p>
+
+                <div class="target-card__actions">
+                  <button class="button button--primary button--compact" @click="useLineSourceAsRoutingTarget(source)">
+                    {{ source.routingTargetName ? "帶入表單" : "加入派送對象" }}
+                  </button>
+                </div>
+              </article>
+
+              <div v-if="lineSources.length === 0" class="empty-state">
+                <p>尚未收到 LINE webhook 事件。先把上方 URL 設到 LINE Developers，然後讓使用者或群組傳一則訊息給 bot。</p>
+              </div>
+            </div>
           </section>
-        </aside>
+        </section>
       </section>
     </main>
   </div>
@@ -1947,6 +2234,51 @@ h3 {
   align-items: start;
 }
 
+.targets-page,
+.targets-grid,
+.target-metrics,
+.source-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.targets-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(24rem, 0.9fr);
+  align-items: start;
+}
+
+.targets-hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.target-metrics {
+  grid-template-columns: repeat(3, minmax(8rem, 1fr));
+  min-width: min(42rem, 100%);
+}
+
+.target-metrics article {
+  padding: 0.68rem 0.78rem;
+  border: 1px solid rgba(21, 27, 35, 0.08);
+  border-radius: 0.9rem;
+  background: rgba(255, 255, 255, 0.58);
+}
+
+.target-metrics span {
+  display: block;
+  color: #54616f;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.target-metrics strong {
+  display: block;
+  margin-top: 0.18rem;
+  font-size: 1.16rem;
+}
+
 .panel {
   padding: 0.88rem;
   border-radius: 1.15rem;
@@ -1954,7 +2286,8 @@ h3 {
 
 .queue-panel,
 .preview-panel,
-.targets-panel {
+.targets-panel,
+.line-sources-panel {
   display: grid;
   gap: 0.72rem;
 }
@@ -2261,6 +2594,11 @@ label span {
   color: #725d1f;
 }
 
+.badge--line-source {
+  background: rgba(18, 125, 86, 0.14);
+  color: #12694c;
+}
+
 .foldout {
   border: 1px solid rgba(21, 27, 35, 0.1);
   border-radius: 1rem;
@@ -2461,6 +2799,32 @@ textarea {
   color: #23313d;
 }
 
+.source-card {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.82rem;
+  border: 1px solid rgba(21, 27, 35, 0.08);
+  border-radius: 0.96rem;
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.72), rgba(240, 248, 244, 0.64));
+}
+
+.source-card__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.7rem;
+}
+
+.source-card__head > div {
+  display: grid;
+  gap: 0.28rem;
+}
+
+.source-card__id {
+  color: #23313d;
+  overflow-wrap: anywhere;
+}
+
 .mono {
   font-family: Consolas, "Cascadia Code", monospace;
 }
@@ -2486,7 +2850,8 @@ code {
 }
 
 @media (max-width: 1280px) {
-  .dashboard {
+  .dashboard,
+  .targets-grid {
     grid-template-columns: 1fr;
   }
 
@@ -2535,11 +2900,14 @@ code {
   .panel__actions,
   .two-up,
   .action-row,
-  .result-card__summary,
-  .bulk-bar,
-  .bulk-bar__group,
-  .target-card__head,
-  .target-card__actions {
+    .result-card__summary,
+    .bulk-bar,
+    .bulk-bar__group,
+    .targets-hero,
+    .target-metrics,
+    .target-card__head,
+    .source-card__head,
+    .target-card__actions {
     display: grid;
   }
 
@@ -2548,5 +2916,68 @@ code {
   .filter-advanced {
     grid-template-columns: 1fr;
   }
+}
+
+.target-ac {
+  position: relative;
+}
+
+.target-ac__dropdown {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  margin: 0;
+  padding: 0.35rem;
+  list-style: none;
+  border: 1px solid rgba(21, 27, 35, 0.12);
+  border-radius: 0.82rem;
+  background: rgba(255, 253, 247, 0.98);
+  box-shadow: 0 8px 24px rgba(28, 35, 43, 0.13);
+  backdrop-filter: blur(8px);
+  max-height: 14rem;
+  overflow-y: auto;
+}
+
+.target-ac__item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.52rem 0.7rem;
+  border-radius: 0.6rem;
+  cursor: pointer;
+}
+
+.target-ac__item:hover {
+  background: rgba(29, 106, 78, 0.08);
+}
+
+.target-ac__name {
+  font-size: 0.87rem;
+  font-weight: 600;
+  color: #23313d;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.target-ac__dest {
+  font-size: 0.77rem;
+  color: #7a8898;
+  font-family: monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 12rem;
+  flex-shrink: 0;
+}
+
+.helper--picked {
+  color: #185d45;
+  font-family: monospace;
+  font-size: 0.82rem;
 }
 </style>

@@ -7,6 +7,7 @@ public sealed class AppOptions
     public required string DatabaseConnectionString { get; init; }
     public required JwtOptions Jwt { get; init; }
     public required TelegramOptions Telegram { get; init; }
+    public required LineOptions Line { get; init; }
     public required int PollSeconds { get; init; }
 
     public static AppOptions Load(IConfiguration configuration)
@@ -28,6 +29,11 @@ public sealed class AppOptions
                 BotToken = configuration["TELEGRAM_BOT_TOKEN"],
                 DefaultTarget = configuration["TELEGRAM_DEFAULT_CHAT_ID"],
                 ParseMode = configuration["TELEGRAM_PARSE_MODE"] ?? "HTML"
+            },
+            Line = new LineOptions
+            {
+                ChannelAccessToken = configuration["LINE_CHANNEL_ACCESS_TOKEN"],
+                ChannelSecret = configuration["LINE_CHANNEL_SECRET"]
             },
             PollSeconds = Math.Max(5, ReadInt(configuration, "NOTIFICATION_POLL_SECONDS", 30))
         };
@@ -99,4 +105,10 @@ public sealed class TelegramOptions
     public string? BotToken { get; init; }
     public string? DefaultTarget { get; init; }
     public string ParseMode { get; init; } = "HTML";
+}
+
+public sealed class LineOptions
+{
+    public string? ChannelAccessToken { get; init; }
+    public string? ChannelSecret { get; init; }
 }
