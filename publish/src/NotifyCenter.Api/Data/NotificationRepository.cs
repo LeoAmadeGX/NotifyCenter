@@ -181,15 +181,17 @@ public sealed class NotificationRepository(NpgsqlDataSource dataSource)
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken))
         {
-            return new NotificationStatsResponse(0, 0, 0, 0, 0, 0);
+            return new NotificationStatsResponse(0, 0, 0, 0, 0, 0, 0, 0);
         }
 
         return new NotificationStatsResponse(
             reader.GetInt32(reader.GetOrdinal("total")),
             reader.GetInt32(reader.GetOrdinal("pending")),
+            0,
             reader.GetInt32(reader.GetOrdinal("sent")),
             reader.GetInt32(reader.GetOrdinal("failed")),
             reader.GetInt32(reader.GetOrdinal("canceled")),
+            0,
             reader.GetInt32(reader.GetOrdinal("due")));
     }
 
@@ -339,7 +341,7 @@ public sealed class NotificationRepository(NpgsqlDataSource dataSource)
             var inserted = await insert.ExecuteScalarAsync(cancellationToken);
             if (inserted is Guid insertedId)
             {
-                return new UpsertResult(insertedId, item.DedupeKey, "created", "pending");
+                return new UpsertResult(insertedId, null, item.DedupeKey, "created", "pending");
             }
         }
 
@@ -349,7 +351,7 @@ public sealed class NotificationRepository(NpgsqlDataSource dataSource)
             await using var reader = await update.ExecuteReaderAsync(cancellationToken);
             if (await reader.ReadAsync(cancellationToken))
             {
-                return new UpsertResult(reader.GetGuid(0), item.DedupeKey, "updated", reader.GetString(1));
+                return new UpsertResult(reader.GetGuid(0), null, item.DedupeKey, "updated", reader.GetString(1));
             }
         }
 
@@ -359,7 +361,7 @@ public sealed class NotificationRepository(NpgsqlDataSource dataSource)
             throw new InvalidOperationException("Notification upsert conflict could not be resolved");
         }
 
-        return new UpsertResult(existing.Id, item.DedupeKey, "skipped", existing.Status);
+        return new UpsertResult(existing.Id, null, item.DedupeKey, "skipped", existing.Status);
     }
 
     private async Task<NotificationItem?> GetByDedupeKeyAsync(
@@ -447,13 +449,17 @@ public sealed class NotificationRepository(NpgsqlDataSource dataSource)
 
     private static NotificationItem ReadItem(NpgsqlDataReader reader)
     {
+        var notificationId = reader.GetGuid(reader.GetOrdinal("id"));
         return new NotificationItem(
-            reader.GetGuid(reader.GetOrdinal("id")),
+            notificationId,
+            notificationId,
             reader.GetString(reader.GetOrdinal("dedupe_key")),
             reader.GetString(reader.GetOrdinal("source_system")),
             reader.GetString(reader.GetOrdinal("event_type")),
             reader.GetString(reader.GetOrdinal("channel")),
+            null,
             reader.GetString(reader.GetOrdinal("target")),
+            !string.IsNullOrWhiteSpace(reader.GetString(reader.GetOrdinal("target"))),
             reader.GetString(reader.GetOrdinal("title")),
             reader.GetString(reader.GetOrdinal("body")),
             ReadTimestamp(reader, "scheduled_at_utc")!.Value,
@@ -463,14 +469,17 @@ public sealed class NotificationRepository(NpgsqlDataSource dataSource)
             ReadTimestamp(reader, "created_at")!.Value,
             ReadTimestamp(reader, "updated_at")!.Value,
             ReadTimestamp(reader, "sent_at_utc"),
-            ReadTimestamp(reader, "canceled_at_utc"));
+            ReadTimestamp(reader, "canceled_at_utc"),
+            null);
     }
 
     private static NotificationAttempt ReadAttempt(NpgsqlDataReader reader)
     {
+        var notificationId = reader.GetGuid(reader.GetOrdinal("notification_id"));
         return new NotificationAttempt(
             reader.GetGuid(reader.GetOrdinal("id")),
-            reader.GetGuid(reader.GetOrdinal("notification_id")),
+            notificationId,
+            notificationId,
             ReadTimestamp(reader, "attempted_at_utc")!.Value,
             reader.GetString(reader.GetOrdinal("status")),
             ReadNullableInt(reader, "http_status"),

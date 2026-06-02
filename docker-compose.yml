@@ -5,6 +5,9 @@ services:
     build:
       context: .
       dockerfile: publish/web.Dockerfile
+      args:
+        - VITE_BASE_PATH=${VITE_BASE_PATH:-/}
+        - NGINX_BASE_PATH=${NGINX_BASE_PATH:-/}
     env_file:
       - .env
     depends_on:
@@ -13,6 +16,8 @@ services:
     ports:
       - "17051:17051"
     restart: unless-stopped
+    networks:
+      - notifycenter_internal
 
   db:
     image: postgres:16-alpine
@@ -29,6 +34,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - notifycenter_internal
 
   api:
     build:
@@ -53,6 +60,19 @@ services:
     ports:
       - "17052:17052"
     restart: unless-stopped
+    networks:
+        notifycenter_internal:
+        app_shared:
+          aliases:
+            - notifycenter-api
 
 volumes:
   pgdata:
+
+networks:
+  notifycenter_internal:
+    driver: bridge
+
+  app_shared:
+    external: true
+    name: app-shared

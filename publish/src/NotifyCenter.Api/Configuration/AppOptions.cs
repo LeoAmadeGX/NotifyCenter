@@ -27,7 +27,7 @@ public sealed class AppOptions
             {
                 BotToken = configuration["TELEGRAM_BOT_TOKEN"],
                 DefaultTarget = configuration["TELEGRAM_DEFAULT_CHAT_ID"],
-                ParseMode = configuration["TELEGRAM_PARSE_MODE"] ?? "Markdown"
+                ParseMode = configuration["TELEGRAM_PARSE_MODE"] ?? "HTML"
             },
             PollSeconds = Math.Max(5, ReadInt(configuration, "NOTIFICATION_POLL_SECONDS", 30))
         };
@@ -98,5 +98,5 @@ public sealed class TelegramOptions
 {
     public string? BotToken { get; init; }
     public string? DefaultTarget { get; init; }
-    public string ParseMode { get; init; } = "Markdown";
+    public string ParseMode { get; init; } = "HTML";
 }

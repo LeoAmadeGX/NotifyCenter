@@ -9,12 +9,12 @@ public sealed class NotificationSenderRegistry(TelegramSender telegramSender)
         return string.Equals(channel, "telegram", StringComparison.OrdinalIgnoreCase);
     }
 
-    public Task<NotificationSendResult> SendAsync(NotificationItem item, CancellationToken cancellationToken)
+    public Task<NotificationSendResult> SendAsync(NotificationItem delivery, CancellationToken cancellationToken)
     {
-        return Normalize(item.Channel) switch
+        return Normalize(delivery.Channel) switch
         {
-            "telegram" => telegramSender.SendAsync(item, cancellationToken),
-            _ => throw new UnsupportedNotificationChannelException(item.Channel)
+            "telegram" => telegramSender.SendAsync(delivery, cancellationToken),
+            _ => throw new UnsupportedNotificationChannelException(delivery.Channel)
         };
     }
 

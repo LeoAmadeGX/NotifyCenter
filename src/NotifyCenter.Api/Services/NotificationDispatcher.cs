@@ -4,9 +4,10 @@ using NotifyCenter.Api.Data;
 namespace NotifyCenter.Api.Services;
 
 public sealed class NotificationDispatcher(
-    NotificationRepository repository,
+    NotificationDeliveryRepository deliveryRepository,
     NotificationSenderRegistry senderRegistry,
     AppOptions options,
+    AdminDashboardEventBroadcaster eventBroadcaster,
     ILogger<NotificationDispatcher> logger) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -17,34 +18,64 @@ public sealed class NotificationDispatcher(
         {
             try
             {
-                var dueItems = await repository.GetDuePendingAsync(DateTimeOffset.UtcNow, 25, stoppingToken);
-                foreach (var item in dueItems)
+                var dueDeliveries = await deliveryRepository.GetDuePendingAsync(DateTimeOffset.UtcNow, 25, stoppingToken);
+                foreach (var delivery in dueDeliveries)
                 {
+                    var effectiveDelivery = delivery.IsTargetOverride
+                        ? delivery
+                        : await deliveryRepository.RefreshResolvedTargetAsync(
+                            delivery.Id,
+                            "This routing target is no longer enabled or available at send time, so the delivery was skipped.",
+                            stoppingToken) ?? delivery;
+
+                    if (string.Equals(effectiveDelivery.Status, "skipped_no_target", StringComparison.OrdinalIgnoreCase))
+                    {
+                        eventBroadcaster.Publish("deliveries_changed", effectiveDelivery.Id, effectiveDelivery.Channel);
+                        logger.LogInformation(
+                            "Delivery {DeliveryId} skipped because its routing target is no longer available",
+                            effectiveDelivery.Id);
+                        continue;
+                    }
+
+                    if (string.Equals(effectiveDelivery.Status, "pending_no_target", StringComparison.OrdinalIgnoreCase) ||
+                        string.IsNullOrWhiteSpace(effectiveDelivery.Target))
+                    {
+                        await deliveryRepository.MarkSkippedNoTargetAsync(effectiveDelivery, stoppingToken);
+                        eventBroadcaster.Publish("deliveries_changed", effectiveDelivery.Id, effectiveDelivery.Channel);
+                        logger.LogInformation(
+                            "Delivery {DeliveryId} skipped because no enabled routing targets were available",
+                            effectiveDelivery.Id);
+                        continue;
+                    }
+
                     try
                     {
-                        var result = await senderRegistry.SendAsync(item, stoppingToken);
-                        await repository.MarkSentAsync(item.Id, result.HttpStatus, result.ResponseBody, stoppingToken);
-                        logger.LogInformation("Notification {NotificationId} sent via {Channel}", item.Id, item.Channel);
+                        var result = await senderRegistry.SendAsync(effectiveDelivery, stoppingToken);
+                        await deliveryRepository.MarkSentAsync(effectiveDelivery, result.HttpStatus, result.ResponseBody, stoppingToken);
+                        eventBroadcaster.Publish("deliveries_changed", effectiveDelivery.Id, effectiveDelivery.Channel);
+                        logger.LogInformation("Delivery {DeliveryId} sent via {Channel}", effectiveDelivery.Id, effectiveDelivery.Channel);
                     }
                     catch (NotificationSendException ex)
                     {
-                        await repository.MarkFailedAsync(
-                            item.Id,
+                        await deliveryRepository.MarkFailedAsync(
+                            effectiveDelivery,
                             ex.HttpStatus,
                             ex.ResponseBody,
                             ex.Message,
                             stoppingToken);
-                        logger.LogWarning(ex, "Notification {NotificationId} failed", item.Id);
+                        eventBroadcaster.Publish("deliveries_changed", effectiveDelivery.Id, effectiveDelivery.Channel);
+                        logger.LogWarning(ex, "Delivery {DeliveryId} failed", effectiveDelivery.Id);
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
                     {
-                        await repository.MarkFailedAsync(
-                            item.Id,
+                        await deliveryRepository.MarkFailedAsync(
+                            effectiveDelivery,
                             null,
                             null,
                             ex.Message,
                             stoppingToken);
-                        logger.LogWarning(ex, "Notification {NotificationId} failed", item.Id);
+                        eventBroadcaster.Publish("deliveries_changed", effectiveDelivery.Id, effectiveDelivery.Channel);
+                        logger.LogWarning(ex, "Delivery {DeliveryId} failed", effectiveDelivery.Id);
                     }
                 }
             }
