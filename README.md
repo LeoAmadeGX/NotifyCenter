@@ -1,18 +1,20 @@
 # NotifyCenter
 
+**v1.1.0**
+
 NotifyCenter 是一個以 `.NET 10 + PostgreSQL + Vue 3` 建立的通知排程與派送中心。
 目前正式支援的通知渠道只有 `Telegram`，但 API 契約保持通用，之後可以繼續擴充其他渠道。
 
-## 目前功能 v1.0.0
+## 目前功能 v1.1.0
 
 - 接收單筆通知與批次通知請求
 - 使用 JWT 驗證外部 producer 權限
 - 依 `dedupeKey` 去重，避免重複建立
-- 以 PostgreSQL 保存通知需求主檔、實際派送單與派送歷程
-- 由 NotifyCenter 中心式管理各頻道收件對象，並在建立通知後物化實際派送單
-- 背景輪詢待送派送單並自動派送
+- 以 PostgreSQL 保存通知需求主檔、實際派送單（delivery）與派送歷程
+- 由 NotifyCenter 中心式管理各頻道收件對象（routing targets），建立通知後自動物化為獨立派送單
+- 背景輪詢待送派送單，在實際送出前再次驗證 routing target 有效性
 - 提供管理台查看派送狀態、明細、失敗紀錄、取消與重試
-- 管理台支援 `messageQuery` 內容搜尋、進階篩選、對象管理與局部自動刷新
+- 管理台支援 `messageQuery` 內容搜尋、進階篩選、對象管理與 SSE 局部自動刷新
 - 首次空資料庫啟動時，自動建立 bootstrap admin 帳號 `amadegx`
 - Admin 密碼只以 `PBKDF2-HMACSHA256 + salt` 雜湊保存，不會明碼寫入資料庫
 - Admin 密碼變更後，舊的管理 session 會失效
@@ -207,4 +209,38 @@ Admin cookie session 也具備 `notifications.admin` 權限，因此管理台可
 
 ## 版本變更紀錄
 
-- 管理台改為 delivery 視角，加入 routing target 管理、SSE 局部刷新與進階搜尋
+### v1.1.0 — 2026-06-02
+
+#### 架構調整
+
+- **Delivery 物化模型**：每筆通知需求（`notification_items`）依啟用中的 routing targets 展開成獨立的派送單（`notification_deliveries`）；管理台與 API 現在以 delivery 為操作主體，而非原始通知需求。
+- **傳送前二次驗證**：Dispatcher 在真正送出前，會再次確認派送單對應的 routing target 仍然有效；若 target 已停用或被刪除，該筆派送單將被標為 `skipped_no_target`。
+- **新增資料表**：`notification_routing_targets`（routing target 主檔）、`notification_deliveries`（派送單）；`notification_attempts` 新增 `delivery_id` 欄位。
+- **舊資料自動遷移**：首次啟動時，系統會自動將現有 `notification_items` 資料補建為對應的派送單，確保不中斷升級。
+
+#### API 變更
+
+- 新增 Routing Target 管理端點：`GET / POST /api/routing-targets`、`PATCH / DELETE /api/routing-targets/{id}`
+- `POST /api/notifications` 與 `POST /api/notifications/bulk` 回應中新增 `deliveryId` 欄位
+- `/api/notifications/{id}` 相關路徑的 `id` 改為指向 `delivery id`
+- 新增派送狀態：`pending_no_target`（建立時無符合 target）、`skipped_no_target`（送出時 target 已失效）
+- 通知統計新增 `pendingNoTarget`、`skipped` 計數
+
+#### 管理台
+
+- 列表改為以 delivery 為視角，顯示 `targetName`、是否為 target override、`skippedAtUtc` 等欄位
+- 新增「對象管理」側邊面板，可直接在管理台新增、編輯、停用、刪除 routing targets（支援 Telegram / Line / Teams）
+- 進階篩選新增 `messageQuery` 搜尋欄位、可展開／收合的進階篩選面板
+- SSE 即時刷新：透過 `GET /api/admin/events` 接收 `deliveries_changed` 事件，自動刷新列表與統計，不需整頁輪詢
+
+#### 其他
+
+- 新增 `nginx.conf`（前端反向代理設定）、`favicon.svg`
+- `publish/` 新增 `preflight-check.sh` 部署前環境檢查腳本
+
+---
+
+### v1.0.0
+
+- 接收單筆與批次通知、JWT 驗證、`dedupeKey` 去重
+- 管理台基本 delivery 視角、對象管理、進階篩選、SSE 局部刷新
