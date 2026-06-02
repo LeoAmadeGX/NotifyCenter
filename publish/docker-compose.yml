@@ -5,6 +5,9 @@ services:
     build:
       context: .
       dockerfile: web.Dockerfile
+      args:
+        - VITE_BASE_PATH=${VITE_BASE_PATH:-/}
+        - NGINX_BASE_PATH=${NGINX_BASE_PATH:-/}
     env_file:
       - .env
     depends_on:

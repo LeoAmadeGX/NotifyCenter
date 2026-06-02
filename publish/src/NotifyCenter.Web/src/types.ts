@@ -6,11 +6,14 @@ export interface AdminSession {
 
 export interface NotificationItem {
   id: string;
+  notificationId: string;
   dedupeKey: string;
   sourceSystem: string;
   eventType: string;
   channel: string;
-  target: string;
+  targetName: string | null;
+  target: string | null;
+  isTargetOverride: boolean;
   title: string;
   body: string;
   scheduledAtUtc: string;
@@ -21,10 +24,12 @@ export interface NotificationItem {
   updatedAt: string;
   sentAtUtc: string | null;
   canceledAtUtc: string | null;
+  skippedAtUtc: string | null;
 }
 
 export interface NotificationAttempt {
   id: string;
+  deliveryId: string;
   notificationId: string;
   attemptedAtUtc: string;
   status: string;
@@ -36,14 +41,17 @@ export interface NotificationAttempt {
 export interface NotificationStats {
   total: number;
   pending: number;
+  pendingNoTarget: number;
   sent: number;
   failed: number;
   canceled: number;
+  skipped: number;
   due: number;
 }
 
 export interface UpsertResult {
-  id: string;
+  notificationId: string;
+  deliveryId: string | null;
   dedupeKey: string;
   action: string;
   status: string;
@@ -68,6 +76,7 @@ export interface NotificationFilters {
   channel: string;
   sourceSystem: string;
   eventType: string;
+  messageQuery: string;
   scheduledFrom: string;
   scheduledTo: string;
   limit: number;
@@ -82,5 +91,26 @@ export interface NotificationCreateInput {
   title: string;
   body: string;
   scheduledAtUtc: string;
+  metadata?: Record<string, unknown> | null;
+}
+
+export interface RoutingTargetItem {
+  id: string;
+  channel: string;
+  name: string;
+  destination: string;
+  isEnabled: boolean;
+  sortOrder: number;
+  metadataJson: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RoutingTargetInput {
+  channel: string;
+  name: string;
+  destination: string;
+  isEnabled: boolean;
+  sortOrder: number;
   metadata?: Record<string, unknown> | null;
 }

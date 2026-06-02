@@ -27,7 +27,12 @@ public sealed record NotificationUpsert(
     DateTimeOffset ScheduledAtUtc,
     string MetadataJson);
 
-public sealed record UpsertResult(Guid Id, string DedupeKey, string Action, string Status);
+public sealed record UpsertResult(
+    Guid NotificationId,
+    Guid? DeliveryId,
+    string DedupeKey,
+    string Action,
+    string Status);
 
 public sealed record BulkNotificationsResponse(
     int Accepted,
@@ -38,11 +43,14 @@ public sealed record BulkNotificationsResponse(
 
 public sealed record NotificationItem(
     Guid Id,
+    Guid NotificationId,
     string DedupeKey,
     string SourceSystem,
     string EventType,
     string Channel,
-    string Target,
+    string? TargetName,
+    string? Target,
+    bool IsTargetOverride,
     string Title,
     string Body,
     DateTimeOffset ScheduledAtUtc,
@@ -52,13 +60,34 @@ public sealed record NotificationItem(
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt,
     DateTimeOffset? SentAtUtc,
-    DateTimeOffset? CanceledAtUtc);
+    DateTimeOffset? CanceledAtUtc,
+    DateTimeOffset? SkippedAtUtc);
 
 public sealed record NotificationAttempt(
     Guid Id,
+    Guid DeliveryId,
     Guid NotificationId,
     DateTimeOffset AttemptedAtUtc,
     string Status,
     int? HttpStatus,
     string? ResponseBody,
     string? Error);
+
+public sealed record RoutingTargetUpsertRequest(
+    string Channel,
+    string Name,
+    string Destination,
+    bool IsEnabled,
+    int SortOrder,
+    JsonElement? Metadata);
+
+public sealed record RoutingTargetItem(
+    Guid Id,
+    string Channel,
+    string Name,
+    string Destination,
+    bool IsEnabled,
+    int SortOrder,
+    string MetadataJson,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt);

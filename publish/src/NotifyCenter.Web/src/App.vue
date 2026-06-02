@@ -1,19 +1,24 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import {
+  adminEventsUrl,
   cancelNotification,
   changePassword,
   createNotification,
   createNotificationsBulk,
+  createRoutingTarget,
+  deleteRoutingTarget,
   getAttempts,
   getFilterOptions,
   getNotification,
   getNotifications,
+  getRoutingTargets,
   getSession,
   getStats,
   login,
   logout,
-  retryNotification
+  retryNotification,
+  updateRoutingTarget
 } from "./api";
 import type {
   AdminSession,
@@ -23,11 +28,20 @@ import type {
   NotificationFilterOptions,
   NotificationFilters,
   NotificationItem,
-  NotificationStats
+  NotificationStats,
+  RoutingTargetInput,
+  RoutingTargetItem,
+  UpsertResult
 } from "./types";
 
-type SidePanel = "preview" | "create" | "batch" | "password";
+type SidePanel = "preview" | "create" | "batch" | "password" | "targets";
 type SelectOption = { label: string; value: string };
+type DashboardEvent = {
+  kind: string;
+  deliveryId?: string | null;
+  channel?: string | null;
+  occurredAt: string;
+};
 
 const loading = ref(true);
 const saving = ref(false);
@@ -42,6 +56,8 @@ const stats = ref<NotificationStats | null>(null);
 const bulkResult = ref<BulkResult | null>(null);
 const selectedIds = ref<string[]>([]);
 const filterOptions = ref<NotificationFilterOptions>(getFallbackFilterOptions());
+const routingTargets = ref<RoutingTargetItem[]>([]);
+const advancedFiltersOpen = ref(false);
 
 const loginForm = reactive({
   username: "amadegx",
@@ -50,9 +66,10 @@ const loginForm = reactive({
 
 const filters = reactive<NotificationFilters>({
   status: "",
-  channel: "telegram",
+  channel: "",
   sourceSystem: "",
   eventType: "",
+  messageQuery: "",
   scheduledFrom: "",
   scheduledTo: "",
   limit: 100
@@ -78,6 +95,21 @@ const passwordForm = reactive({
   newPassword: "",
   confirmPassword: ""
 });
+
+const routingTargetForm = reactive({
+  id: "",
+  channel: "telegram",
+  name: "",
+  destination: "",
+  isEnabled: true,
+  sortOrder: 0,
+  metadataJson: ""
+});
+
+let refreshIntervalHandle: number | null = null;
+let passiveRefreshHandle: number | null = null;
+let passiveRefreshWantsPreview = false;
+let eventSource: EventSource | null = null;
 
 const isLoggedIn = computed(() => session.value !== null);
 const canRetrySelected = computed(() => selectedNotification.value?.status === "failed");
@@ -105,12 +137,21 @@ const cancelableSelectedIds = computed(() =>
 const nonCancelableSelectedCount = computed(
   () => selectedCount.value - cancelableSelectedIds.value.length
 );
+const hasAdvancedFilters = computed(
+  () =>
+    Boolean(filters.channel) ||
+    Boolean(filters.scheduledFrom) ||
+    Boolean(filters.scheduledTo) ||
+    Boolean(filters.messageQuery)
+);
 const statusOptions = computed(() => [
   { label: "全部", value: "", count: stats.value?.total ?? notifications.value.length },
   { label: "待派送", value: "pending", count: stats.value?.pending ?? 0 },
+  { label: "待配置", value: "pending_no_target", count: stats.value?.pendingNoTarget ?? 0 },
   { label: "失敗", value: "failed", count: stats.value?.failed ?? 0 },
   { label: "已送達", value: "sent", count: stats.value?.sent ?? 0 },
-  { label: "已取消", value: "canceled", count: stats.value?.canceled ?? 0 }
+  { label: "已取消", value: "canceled", count: stats.value?.canceled ?? 0 },
+  { label: "已略過", value: "skipped_no_target", count: stats.value?.skipped ?? 0 }
 ]);
 const channelOptions = computed(() =>
   buildSelectOptions(filterOptions.value.channels, ["telegram"], filters.channel)
@@ -125,9 +166,62 @@ const eventTypeOptions = computed(() =>
     filters.eventType
   )
 );
+const routingChannelOptions = [
+  { label: "telegram", value: "telegram" },
+  { label: "line", value: "line" },
+  { label: "teams", value: "teams" }
+];
+const routingDestinationLabel = computed(() => {
+  switch (routingTargetForm.channel) {
+    case "telegram":
+      return "Telegram Chat ID";
+    case "teams":
+      return "Webhook URL";
+    case "line":
+      return "Line 對象 ID";
+    default:
+      return "Destination";
+  }
+});
+const routingDestinationPlaceholder = computed(() => {
+  switch (routingTargetForm.channel) {
+    case "telegram":
+      return "例如：123456789 或 -1001234567890";
+    case "teams":
+      return "例如：https://outlook.office.com/webhook/...";
+    case "line":
+      return "例如：groupId、userId 或未來的 recipient key";
+    default:
+      return "";
+  }
+});
+const routingTargetHint = computed(() => {
+  switch (routingTargetForm.channel) {
+    case "telegram":
+      return "Telegram 的 Bot Token 仍然讀取 .env 的 TELEGRAM_BOT_TOKEN；這裡只填 chat id。預設 parse mode 現在是 HTML。";
+    case "teams":
+      return "Teams 目前先管理對象設定，這一輪還沒有實際 sender。";
+    case "line":
+      return "Line 目前先管理對象設定，這一輪還沒有實際 sender。";
+    default:
+      return "";
+  }
+});
 
 onMounted(async () => {
+  document.addEventListener("visibilitychange", handleVisibilityChange);
   await restoreSession();
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener("visibilitychange", handleVisibilityChange);
+  stopAutoRefresh();
+  closeEventStream();
+
+  if (passiveRefreshHandle !== null) {
+    window.clearTimeout(passiveRefreshHandle);
+    passiveRefreshHandle = null;
+  }
 });
 
 async function restoreSession() {
@@ -137,10 +231,18 @@ async function restoreSession() {
   try {
     session.value = await getSession();
     applySessionDefaults(session.value, true);
-    await loadDashboard();
+    await loadDashboard({
+      refreshFilters: true,
+      refreshTargets: true,
+      syncPreview: true
+    });
+    startAutoRefresh();
+    openEventStream();
   } catch {
     session.value = null;
     resetBatchPayload(true);
+    stopAutoRefresh();
+    closeEventStream();
   } finally {
     loading.value = false;
   }
@@ -155,7 +257,13 @@ async function handleLogin() {
     session.value = await login(loginForm.username, loginForm.password);
     applySessionDefaults(session.value, true);
     loginForm.password = "";
-    await loadDashboard();
+    await loadDashboard({
+      refreshFilters: true,
+      refreshTargets: true,
+      syncPreview: true
+    });
+    startAutoRefresh();
+    openEventStream();
   } catch (error) {
     errorMessage.value = toMessage(error);
   } finally {
@@ -170,6 +278,8 @@ async function handleLogout() {
 
   try {
     await logout();
+    stopAutoRefresh();
+    closeEventStream();
     session.value = null;
     notifications.value = [];
     attempts.value = [];
@@ -177,10 +287,12 @@ async function handleLogout() {
     stats.value = null;
     selectedIds.value = [];
     bulkResult.value = null;
+    routingTargets.value = [];
     sidePanel.value = "preview";
     filterOptions.value = getFallbackFilterOptions();
     resetCreateForm();
     resetBatchPayload(true);
+    resetRoutingTargetForm();
   } catch (error) {
     errorMessage.value = toMessage(error);
   } finally {
@@ -188,8 +300,41 @@ async function handleLogout() {
   }
 }
 
-async function loadDashboard() {
-  await Promise.all([loadStats(), loadNotifications(), loadFilterOptions()]);
+async function runManualRefresh() {
+  loading.value = true;
+  errorMessage.value = "";
+
+  try {
+    await loadDashboard({
+      refreshFilters: true,
+      refreshTargets: sidePanel.value === "targets",
+      syncPreview: sidePanel.value === "preview"
+    });
+  } catch (error) {
+    errorMessage.value = toMessage(error);
+  } finally {
+    loading.value = false;
+  }
+}
+
+async function loadDashboard(options?: {
+  refreshFilters?: boolean;
+  refreshTargets?: boolean;
+  syncPreview?: boolean;
+}) {
+  const tasks: Promise<unknown>[] = [loadStats(), loadNotifications()];
+  if (options?.refreshFilters) {
+    tasks.push(loadFilterOptions());
+  }
+  if (options?.refreshTargets) {
+    tasks.push(loadRoutingTargets());
+  }
+
+  await Promise.all(tasks);
+
+  if (options?.syncPreview && sidePanel.value === "preview") {
+    await refreshSelectedPreview();
+  }
 }
 
 async function loadStats() {
@@ -205,6 +350,11 @@ async function loadFilterOptions() {
   }
 }
 
+async function loadRoutingTargets() {
+  const response = await getRoutingTargets();
+  routingTargets.value = response.items;
+}
+
 async function loadNotifications() {
   const response = await getNotifications(filters);
   notifications.value = sortNotifications(response.items);
@@ -218,27 +368,114 @@ async function loadNotifications() {
     return;
   }
 
-  const preferredId =
-    selectedNotification.value && notifications.value.some((item) => item.id === selectedNotification.value?.id)
-      ? selectedNotification.value.id
-      : notifications.value[0].id;
+  const nextSelected =
+    notifications.value.find((item) => item.id === selectedNotification.value?.id) ??
+    notifications.value[0];
 
-  await selectNotification(preferredId, false);
+  if (selectedNotification.value?.id !== nextSelected.id) {
+    attempts.value = [];
+  }
+
+  selectedNotification.value = nextSelected;
 }
 
-async function selectNotification(id: string, focusPreview = true) {
-  if (focusPreview) {
-    sidePanel.value = "preview";
+async function refreshSummaryAndList(options?: { syncPreview?: boolean }) {
+  try {
+    await Promise.all([loadStats(), loadNotifications()]);
+
+    if (options?.syncPreview && sidePanel.value === "preview") {
+      await refreshSelectedPreview();
+    }
+  } catch (error) {
+    errorMessage.value = toMessage(error);
+  }
+}
+
+async function refreshSelectedPreview() {
+  if (sidePanel.value !== "preview" || !selectedNotification.value) {
+    return;
   }
 
   errorMessage.value = "";
 
   try {
-    const [item, attemptResponse] = await Promise.all([getNotification(id), getAttempts(id)]);
+    const [item, attemptResponse] = await Promise.all([
+      getNotification(selectedNotification.value.id),
+      getAttempts(selectedNotification.value.id)
+    ]);
     selectedNotification.value = item;
     attempts.value = attemptResponse.items;
   } catch (error) {
     errorMessage.value = toMessage(error);
+    attempts.value = [];
+  }
+}
+
+function startAutoRefresh() {
+  stopAutoRefresh();
+
+  refreshIntervalHandle = window.setInterval(() => {
+    if (!document.hidden) {
+      void refreshSummaryAndList({ syncPreview: sidePanel.value === "preview" });
+    }
+  }, 60_000);
+}
+
+function stopAutoRefresh() {
+  if (refreshIntervalHandle !== null) {
+    window.clearInterval(refreshIntervalHandle);
+    refreshIntervalHandle = null;
+  }
+}
+
+function openEventStream() {
+  closeEventStream();
+  if (!session.value) {
+    return;
+  }
+
+  eventSource = new EventSource(adminEventsUrl);
+  eventSource.addEventListener("dashboard", (event) => {
+    try {
+      const payload = JSON.parse((event as MessageEvent<string>).data) as DashboardEvent;
+      const shouldSyncPreview =
+        sidePanel.value === "preview" &&
+        (!payload.deliveryId || payload.deliveryId === selectedNotification.value?.id);
+      queuePassiveRefresh(shouldSyncPreview);
+    } catch {
+      queuePassiveRefresh(sidePanel.value === "preview");
+    }
+  });
+  eventSource.onerror = () => {
+    // Native EventSource will retry automatically; no UI action needed here.
+  };
+}
+
+function closeEventStream() {
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+}
+
+function queuePassiveRefresh(syncPreview: boolean) {
+  passiveRefreshWantsPreview = passiveRefreshWantsPreview || syncPreview;
+
+  if (passiveRefreshHandle !== null) {
+    return;
+  }
+
+  passiveRefreshHandle = window.setTimeout(() => {
+    const shouldSyncPreview = passiveRefreshWantsPreview;
+    passiveRefreshWantsPreview = false;
+    passiveRefreshHandle = null;
+    void refreshSummaryAndList({ syncPreview: shouldSyncPreview });
+  }, 500);
+}
+
+function handleVisibilityChange() {
+  if (!document.hidden && session.value) {
+    queuePassiveRefresh(sidePanel.value === "preview");
   }
 }
 
@@ -256,9 +493,7 @@ async function applyFilters() {
   errorMessage.value = "";
 
   try {
-    await loadNotifications();
-  } catch (error) {
-    errorMessage.value = toMessage(error);
+    await refreshSummaryAndList({ syncPreview: sidePanel.value === "preview" });
   } finally {
     loading.value = false;
   }
@@ -267,6 +502,10 @@ async function applyFilters() {
 async function setStatusFilter(value: string) {
   filters.status = value;
   await applyFilters();
+}
+
+function toggleAdvancedFilters() {
+  advancedFiltersOpen.value = !advancedFiltersOpen.value;
 }
 
 function openCreatePanel() {
@@ -281,6 +520,11 @@ function openPasswordPanel() {
   sidePanel.value = "password";
 }
 
+async function openTargetsPanel() {
+  sidePanel.value = "targets";
+  await loadRoutingTargets();
+}
+
 function clearSelection() {
   selectedIds.value = [];
 }
@@ -292,12 +536,14 @@ function clearDateRange() {
 
 function resetFilters() {
   filters.status = "";
-  filters.channel = "telegram";
+  filters.channel = "";
   filters.sourceSystem = "";
   filters.eventType = "";
+  filters.messageQuery = "";
   filters.scheduledFrom = "";
   filters.scheduledTo = "";
   filters.limit = 100;
+  advancedFiltersOpen.value = false;
 }
 
 function changeLimit(delta: number) {
@@ -326,9 +572,22 @@ function toggleSelectAllVisible() {
   selectedIds.value = notifications.value.map((item) => item.id);
 }
 
+async function selectNotification(id: string, focusPreview = true) {
+  const item = notifications.value.find((candidate) => candidate.id === id);
+  if (item) {
+    selectedNotification.value = item;
+  }
+
+  if (focusPreview) {
+    sidePanel.value = "preview";
+  }
+
+  await refreshSelectedPreview();
+}
+
 async function performBulkCancel() {
   if (cancelableSelectedIds.value.length === 0) {
-    errorMessage.value = "目前沒有可批次取消的通知。";
+    errorMessage.value = "目前沒有可批次取消的派送單。";
     return;
   }
 
@@ -350,7 +609,7 @@ async function performBulkCancel() {
     }
 
     if (canceled > 0) {
-      successMessage.value = `已取消 ${canceled} 筆通知。`;
+      successMessage.value = `已取消 ${canceled} 筆派送單。`;
     }
 
     if (failures.length > 0) {
@@ -360,7 +619,7 @@ async function performBulkCancel() {
           : `有 ${failures.length} 筆取消失敗，第一個錯誤：${failures[0]}`;
     }
 
-    await loadDashboard();
+    await refreshSummaryAndList({ syncPreview: sidePanel.value === "preview" });
   } finally {
     saving.value = false;
   }
@@ -373,7 +632,9 @@ function useSelectedAsDraft() {
 
   createForm.title = selectedNotification.value.title;
   createForm.body = selectedNotification.value.body;
-  createForm.target = selectedNotification.value.target;
+  createForm.target = selectedNotification.value.isTargetOverride
+    ? selectedNotification.value.target ?? ""
+    : "";
   createForm.sourceSystem = selectedNotification.value.sourceSystem || "admin-ui";
   createForm.eventType = selectedNotification.value.eventType || "manual.notification";
   createForm.dedupeKey = "";
@@ -389,13 +650,13 @@ async function submitCreate() {
   successMessage.value = "";
 
   try {
-    const result = (await createNotification(buildCreatePayload())) as { id?: string };
-    successMessage.value = "通知已建立並加入排程。";
+    const result = (await createNotification(buildCreatePayload())) as UpsertResult;
+    successMessage.value = "通知需求已建立，派送單已重新整理。";
     resetCreateForm();
-    await loadDashboard();
+    await refreshSummaryAndList({ syncPreview: false });
 
-    if (result.id) {
-      await selectNotification(result.id, true);
+    if (result.deliveryId) {
+      await selectNotification(result.deliveryId, true);
     }
 
     sidePanel.value = "preview";
@@ -421,8 +682,8 @@ async function submitBatch() {
     }
 
     bulkResult.value = await createNotificationsBulk(notificationsInput);
-    successMessage.value = "批次通知已送交處理。";
-    await loadDashboard();
+    successMessage.value = "批次通知需求已送交處理。";
+    await refreshSummaryAndList({ syncPreview: sidePanel.value === "preview" });
     sidePanel.value = "batch";
   } catch (error) {
     errorMessage.value = toMessage(error);
@@ -462,8 +723,8 @@ async function performCancel(id: string) {
 
   try {
     await cancelNotification(id);
-    successMessage.value = "通知已取消。";
-    await loadDashboard();
+    successMessage.value = "派送單已取消。";
+    await refreshSummaryAndList({ syncPreview: sidePanel.value === "preview" });
   } catch (error) {
     errorMessage.value = toMessage(error);
   } finally {
@@ -477,9 +738,81 @@ async function performRetry(id: string) {
   successMessage.value = "";
 
   try {
-    await retryNotification(id);
-    successMessage.value = "通知已重新排入派送佇列。";
-    await loadDashboard();
+    const result = await retryNotification(id);
+    successMessage.value = result.skipped
+      ? "這筆失敗的派送單對應對象已不存在或停用，已直接略過。"
+      : "失敗的派送單已重新排入派送。";
+    await refreshSummaryAndList({ syncPreview: sidePanel.value === "preview" });
+  } catch (error) {
+    errorMessage.value = toMessage(error);
+  } finally {
+    saving.value = false;
+  }
+}
+
+function startEditingRoutingTarget(item: RoutingTargetItem) {
+  routingTargetForm.id = item.id;
+  routingTargetForm.channel = item.channel;
+  routingTargetForm.name = item.name;
+  routingTargetForm.destination = item.destination;
+  routingTargetForm.isEnabled = item.isEnabled;
+  routingTargetForm.sortOrder = item.sortOrder;
+  routingTargetForm.metadataJson = formatJson(item.metadataJson);
+  sidePanel.value = "targets";
+}
+
+function resetRoutingTargetForm() {
+  routingTargetForm.id = "";
+  routingTargetForm.channel = "telegram";
+  routingTargetForm.name = "";
+  routingTargetForm.destination = "";
+  routingTargetForm.isEnabled = true;
+  routingTargetForm.sortOrder = 0;
+  routingTargetForm.metadataJson = "";
+}
+
+async function submitRoutingTarget() {
+  saving.value = true;
+  errorMessage.value = "";
+  successMessage.value = "";
+
+  try {
+    const input = buildRoutingTargetPayload();
+    if (routingTargetForm.id) {
+      await updateRoutingTarget(routingTargetForm.id, input);
+      successMessage.value = "對象設定已更新。";
+    } else {
+      await createRoutingTarget(input);
+      successMessage.value = "對象設定已建立。";
+    }
+
+    resetRoutingTargetForm();
+    await Promise.all([
+      loadRoutingTargets(),
+      refreshSummaryAndList({ syncPreview: sidePanel.value === "preview" })
+    ]);
+  } catch (error) {
+    errorMessage.value = toMessage(error);
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function removeRoutingTarget(id: string) {
+  saving.value = true;
+  errorMessage.value = "";
+  successMessage.value = "";
+
+  try {
+    await deleteRoutingTarget(id);
+    if (routingTargetForm.id === id) {
+      resetRoutingTargetForm();
+    }
+    successMessage.value = "對象設定已刪除。";
+    await Promise.all([
+      loadRoutingTargets(),
+      refreshSummaryAndList({ syncPreview: sidePanel.value === "preview" })
+    ]);
   } catch (error) {
     errorMessage.value = toMessage(error);
   } finally {
@@ -488,18 +821,27 @@ async function performRetry(id: string) {
 }
 
 function buildCreatePayload(): NotificationCreateInput {
-  const target = createForm.target.trim() || session.value?.telegramDefaultTarget || null;
-
   return {
     dedupeKey: createForm.dedupeKey || null,
     sourceSystem: createForm.sourceSystem || null,
     eventType: createForm.eventType || null,
     channel: "telegram",
-    target,
+    target: createForm.target.trim() || null,
     title: createForm.title,
     body: createForm.body,
     scheduledAtUtc: new Date(createForm.scheduledAtLocal).toISOString(),
     metadata: parseMetadata(createForm.metadataJson)
+  };
+}
+
+function buildRoutingTargetPayload(): RoutingTargetInput {
+  return {
+    channel: routingTargetForm.channel,
+    name: routingTargetForm.name,
+    destination: routingTargetForm.destination,
+    isEnabled: routingTargetForm.isEnabled,
+    sortOrder: routingTargetForm.sortOrder,
+    metadata: parseMetadata(routingTargetForm.metadataJson)
   };
 }
 
@@ -508,19 +850,15 @@ function applySessionDefaults(currentSession: AdminSession | null, force: boolea
     return;
   }
 
-  if (force || !createForm.target.trim()) {
-    createForm.target = currentSession.telegramDefaultTarget ?? "";
-  }
-
   if (force || !batchForm.payload.trim()) {
-    resetBatchPayload(true, currentSession.telegramDefaultTarget);
+    resetBatchPayload(true);
   }
 }
 
 function resetCreateForm() {
   createForm.title = "";
   createForm.body = "";
-  createForm.target = session.value?.telegramDefaultTarget ?? "";
+  createForm.target = "";
   createForm.dedupeKey = "";
   createForm.sourceSystem = "admin-ui";
   createForm.eventType = "manual.notification";
@@ -528,22 +866,21 @@ function resetCreateForm() {
   createForm.metadataJson = "";
 }
 
-function resetBatchPayload(force: boolean, defaultTarget?: string | null) {
+function resetBatchPayload(force: boolean) {
   if (!force && batchForm.payload.trim()) {
     return;
   }
 
-  batchForm.payload = createBatchExample(defaultTarget ?? session.value?.telegramDefaultTarget ?? null);
+  batchForm.payload = createBatchExample();
 }
 
-function createBatchExample(defaultTarget: string | null) {
+function createBatchExample() {
   return JSON.stringify(
     [
       {
         title: "Daily report",
         body: "NotifyCenter has completed the 09:00 summary.",
         channel: "telegram",
-        target: defaultTarget ?? "1323447026",
         sourceSystem: "admin-ui",
         eventType: "manual.batch",
         scheduledAtUtc: new Date(Date.now() + 10 * 60 * 1000).toISOString()
@@ -633,16 +970,7 @@ function hasMeaningfulMetadata(value: string) {
       return parsed.length > 0;
     }
 
-    const keys = Object.keys(parsed as Record<string, unknown>);
-    if (keys.length === 0) {
-      return false;
-    }
-
-    if (keys.length === 1 && keys[0] === "priority" && (parsed as { priority?: string }).priority === "normal") {
-      return false;
-    }
-
-    return true;
+    return Object.keys(parsed as Record<string, unknown>).length > 0;
   } catch {
     return true;
   }
@@ -650,40 +978,48 @@ function hasMeaningfulMetadata(value: string) {
 
 function summarizeBody(value: string) {
   const compact = value.replace(/\s+/g, " ").trim();
-  return compact.length > 78 ? `${compact.slice(0, 78)}…` : compact;
+  return compact.length > 88 ? `${compact.slice(0, 88)}…` : compact;
 }
 
 function statusLabel(status: string) {
   switch (status) {
     case "pending":
       return "待派送";
+    case "pending_no_target":
+      return "待配置對象";
     case "sent":
       return "已送達";
     case "failed":
       return "失敗";
     case "canceled":
       return "已取消";
+    case "skipped_no_target":
+      return "已略過";
     default:
       return status;
   }
 }
 
 function canCancelStatus(status: string | undefined) {
-  return status === "pending" || status === "failed";
+  return status === "pending" || status === "pending_no_target" || status === "failed";
 }
 
 function getStatusRank(status: string) {
   switch (status) {
     case "pending":
       return 0;
-    case "failed":
+    case "pending_no_target":
       return 1;
-    case "sent":
+    case "failed":
       return 2;
-    case "canceled":
+    case "sent":
       return 3;
-    default:
+    case "canceled":
       return 4;
+    case "skipped_no_target":
+      return 5;
+    default:
+      return 6;
   }
 }
 
@@ -735,6 +1071,34 @@ function uniqueSorted(values: string[]) {
   );
 }
 
+function targetSummary(item: NotificationItem) {
+  if (item.targetName && item.target) {
+    return `${item.targetName} · ${item.target}`;
+  }
+
+  if (item.targetName) {
+    return item.targetName;
+  }
+
+  if (item.target) {
+    return item.target;
+  }
+
+  return "未配置對象";
+}
+
+function targetDescription(item: NotificationItem) {
+  if (item.isTargetOverride) {
+    return "單筆覆蓋";
+  }
+
+  if (item.targetName) {
+    return item.targetName;
+  }
+
+  return "NotifyCenter 路由";
+}
+
 function toMessage(error: unknown) {
   return error instanceof Error ? error.message : "發生未預期錯誤。";
 }
@@ -748,7 +1112,7 @@ function toMessage(error: unknown) {
     <main v-if="!isLoggedIn" class="login-card">
       <p class="eyebrow">NotifyCenter Admin</p>
       <h1>登入後台</h1>
-      <p class="subtitle">先看通知清單，再決定要取消、重送或新增內容。</p>
+      <p class="subtitle">查看待派送、失敗與已略過的派送單，並由中心式設定決定實際通知對象。</p>
 
       <form class="stack" @submit.prevent="handleLogin">
         <label>
@@ -773,11 +1137,18 @@ function toMessage(error: unknown) {
         <div>
           <p class="eyebrow">NotifyCenter Console</p>
           <h1>個人化通知中心</h1>
-          <p class="subtitle">負責提醒通知的小玩具。</p>
+          <p class="subtitle">中心式決定誰會收到通知，主控台只局部刷新清單與統計，不打斷你手上的輸入。</p>
         </div>
         <div class="topbar__actions">
-          <button class="button button--ghost button--compact" @click="loadDashboard" :disabled="loading || saving">
+          <button class="button button--ghost button--compact" @click="runManualRefresh" :disabled="loading || saving">
             重新整理
+          </button>
+          <button
+            class="button button--ghost button--compact"
+            :class="{ 'button--selected': sidePanel === 'targets' }"
+            @click="openTargetsPanel"
+          >
+            對象管理
           </button>
           <button class="button button--ghost button--compact" @click="openPasswordPanel">修改密碼</button>
           <button class="button button--primary button--compact" @click="handleLogout" :disabled="loading || saving">
@@ -789,7 +1160,7 @@ function toMessage(error: unknown) {
       <section v-if="session?.mustChangePassword" class="warning-card">
         <div>
           <p class="warning-card__title">這是首次登入，建議立即更新密碼</p>
-          <p class="warning-card__body">你現在可以先使用後台，但提醒會持續顯示，直到密碼成功變更為止。</p>
+          <p class="warning-card__body">你可以先使用主控台，但提醒會持續顯示直到密碼成功更新為止。</p>
         </div>
         <button class="button button--warning button--compact" @click="openPasswordPanel">立即改密碼</button>
       </section>
@@ -805,6 +1176,10 @@ function toMessage(error: unknown) {
           <strong>{{ stats?.pending ?? 0 }}</strong>
         </article>
         <article class="summary-card">
+          <span>待配置對象</span>
+          <strong>{{ stats?.pendingNoTarget ?? 0 }}</strong>
+        </article>
+        <article class="summary-card">
           <span>逾時待送</span>
           <strong>{{ stats?.due ?? 0 }}</strong>
         </article>
@@ -817,7 +1192,7 @@ function toMessage(error: unknown) {
           <strong>{{ stats?.sent ?? 0 }}</strong>
         </article>
         <article class="summary-card">
-          <span>總筆數</span>
+          <span>總派送單</span>
           <strong>{{ stats?.total ?? 0 }}</strong>
         </article>
       </section>
@@ -826,8 +1201,7 @@ function toMessage(error: unknown) {
         <section class="panel queue-panel">
           <div class="panel__header">
             <div>
-              <h2>通知清單</h2>
-              <p class="panel__hint">待派送會自動排前面，左側清單維持高密度顯示，方便大量資料時快速掃描。</p>
+              <h2>派送清單</h2>
             </div>
             <div class="panel__actions">
               <button
@@ -867,58 +1241,46 @@ function toMessage(error: unknown) {
             </button>
           </div>
 
-          <form class="filter-grid" @submit.prevent="applyFilters">
-            <label class="field">
-              <span>頻道</span>
-              <select v-model="filters.channel">
-                <option v-for="option in channelOptions" :key="option.value || 'all'" :value="option.value">
-                  {{ option.label }}
-                </option>
-              </select>
-            </label>
+          <form class="filter-shell" @submit.prevent="applyFilters">
+            <div class="filter-main">
+              <label class="field">
+                <span>Source System</span>
+                <select v-model="filters.sourceSystem">
+                  <option v-for="option in sourceSystemOptions" :key="option.value || 'all'" :value="option.value">
+                    {{ option.label }}
+                  </option>
+                </select>
+              </label>
 
-            <label class="field">
-              <span>Source System</span>
-              <select v-model="filters.sourceSystem">
-                <option v-for="option in sourceSystemOptions" :key="option.value || 'all'" :value="option.value">
-                  {{ option.label }}
-                </option>
-              </select>
-            </label>
+              <label class="field">
+                <span>Event Type</span>
+                <select v-model="filters.eventType">
+                  <option v-for="option in eventTypeOptions" :key="option.value || 'all'" :value="option.value">
+                    {{ option.label }}
+                  </option>
+                </select>
+              </label>
 
-            <label class="field">
-              <span>Event Type</span>
-              <select v-model="filters.eventType">
-                <option v-for="option in eventTypeOptions" :key="option.value || 'all'" :value="option.value">
-                  {{ option.label }}
-                </option>
-              </select>
-            </label>
-
-            <label class="field field--limit">
-              <span>顯示筆數</span>
-              <div class="stepper">
-                <input v-model.number="filters.limit" min="1" max="500" type="number" />
-                <div class="stepper__buttons">
-                  <button type="button" @click="changeLimit(10)">▴</button>
-                  <button type="button" @click="changeLimit(-10)">▾</button>
+              <label class="field field--limit">
+                <span>顯示筆數</span>
+                <div class="stepper">
+                  <input v-model.number="filters.limit" min="1" max="500" type="number" />
+                  <div class="stepper__buttons">
+                    <button type="button" @click="changeLimit(10)">▴</button>
+                    <button type="button" @click="changeLimit(-10)">▾</button>
+                  </div>
                 </div>
-              </div>
-            </label>
+              </label>
 
-            <label class="field">
-              <span>排程起</span>
-              <input v-model="filters.scheduledFrom" type="datetime-local" />
-            </label>
-
-            <label class="field">
-              <span>排程迄</span>
-              <input v-model="filters.scheduledTo" type="datetime-local" />
-            </label>
-
-            <div class="filter-actions">
+              <button
+                class="button button--ghost button--compact"
+                type="button"
+                :class="{ 'button--selected': advancedFiltersOpen || hasAdvancedFilters }"
+                @click="toggleAdvancedFilters"
+              >
+                進階篩選
+              </button>
               <button class="button button--primary button--compact" :disabled="loading || saving">套用篩選</button>
-              <button class="button button--ghost button--compact" type="button" @click="clearDateRange">清空時間</button>
               <button
                 class="button button--ghost button--compact"
                 type="button"
@@ -928,6 +1290,36 @@ function toMessage(error: unknown) {
                 "
               >
                 重設篩選
+              </button>
+            </div>
+
+            <div v-if="advancedFiltersOpen || hasAdvancedFilters" class="filter-advanced">
+              <label class="field">
+                <span>頻道</span>
+                <select v-model="filters.channel">
+                  <option v-for="option in channelOptions" :key="option.value || 'all'" :value="option.value">
+                    {{ option.label }}
+                  </option>
+                </select>
+              </label>
+
+              <label class="field">
+                <span>排程起</span>
+                <input v-model="filters.scheduledFrom" type="datetime-local" />
+              </label>
+
+              <label class="field">
+                <span>排程迄</span>
+                <input v-model="filters.scheduledTo" type="datetime-local" />
+              </label>
+
+              <label class="field field--wide">
+                <span>訊息內容</span>
+                <input v-model="filters.messageQuery" placeholder="搜尋標題或內文" />
+              </label>
+
+              <button class="button button--ghost button--compact" type="button" @click="clearDateRange">
+                清空時間
               </button>
             </div>
           </form>
@@ -965,7 +1357,7 @@ function toMessage(error: unknown) {
               <span></span>
               <span>通知</span>
               <span>排程</span>
-              <span>Target</span>
+              <span>對象</span>
               <span>狀態</span>
             </div>
 
@@ -984,12 +1376,18 @@ function toMessage(error: unknown) {
                   <div class="queue-row__title">
                     <strong>{{ item.title }}</strong>
                     <p>{{ summarizeBody(item.body) }}</p>
+                    <p class="queue-row__submeta">
+                      {{ item.channel }} · {{ item.sourceSystem }} · {{ item.eventType }}
+                    </p>
                     <p v-if="item.status === 'failed' && item.lastError" class="queue-row__error">
                       {{ item.lastError }}
                     </p>
                   </div>
                   <div class="queue-row__meta">{{ formatDateCompact(item.scheduledAtUtc) }}</div>
-                  <div class="queue-row__meta mono">{{ item.target }}</div>
+                  <div class="queue-row__meta">
+                    <strong>{{ targetSummary(item) }}</strong>
+                    <small>{{ targetDescription(item) }}</small>
+                  </div>
                   <div class="queue-row__status">
                     <span class="badge" :class="`badge--${item.status}`">{{ statusLabel(item.status) }}</span>
                   </div>
@@ -998,7 +1396,7 @@ function toMessage(error: unknown) {
             </div>
 
             <div v-else class="empty-state">
-              <p>目前沒有符合條件的通知。你可以調整時間區間，或先從右側建立新通知。</p>
+              <p>目前沒有符合條件的派送單。你可以調整篩選、建立新通知需求，或先設定頻道對象。</p>
             </div>
           </div>
         </section>
@@ -1007,8 +1405,7 @@ function toMessage(error: unknown) {
           <section v-if="sidePanel === 'preview'" class="panel preview-panel">
             <div class="panel__header">
               <div>
-                <h2>{{ selectedNotification ? selectedNotification.title : "通知預覽" }}</h2>
-                <p class="panel__hint">右側只保留預覽與操作，不再用大片留白堆疊資訊。</p>
+                <h2>{{ selectedNotification ? selectedNotification.title : "派送預覽" }}</h2>
               </div>
               <button v-if="selectedNotification" class="button button--ghost button--compact" @click="useSelectedAsDraft">
                 以此為藍本
@@ -1021,8 +1418,10 @@ function toMessage(error: unknown) {
                   {{ statusLabel(selectedNotification.status) }}
                 </span>
                 <span class="mini-chip">{{ formatDateCompact(selectedNotification.scheduledAtUtc) }}</span>
-                <span class="mini-chip mono">{{ selectedNotification.target }}</span>
                 <span class="mini-chip">{{ selectedNotification.channel }}</span>
+                <span class="mini-chip mono">{{ selectedNotification.target ?? "未配置對象" }}</span>
+                <span v-if="selectedNotification.targetName" class="mini-chip">{{ selectedNotification.targetName }}</span>
+                <span v-if="selectedNotification.isTargetOverride" class="mini-chip">override</span>
               </div>
 
               <article class="message-preview">
@@ -1038,7 +1437,7 @@ function toMessage(error: unknown) {
                   @click="performCancel(selectedNotification.id)"
                   :disabled="saving || !canCancelSelected"
                 >
-                  取消通知
+                  取消派送單
                 </button>
                 <button
                   class="button button--primary button--compact"
@@ -1050,7 +1449,7 @@ function toMessage(error: unknown) {
               </div>
 
               <details class="foldout" :open="attempts.length > 0">
-                <summary>派送記錄 <span>{{ attempts.length }}</span></summary>
+                <summary>派送紀錄 <span>{{ attempts.length }}</span></summary>
                 <div class="foldout__content">
                   <div v-if="attempts.length > 0" class="table-wrap">
                     <table>
@@ -1074,7 +1473,7 @@ function toMessage(error: unknown) {
                       </tbody>
                     </table>
                   </div>
-                  <p v-else class="mini-empty">這筆通知目前還沒有派送紀錄。</p>
+                  <p v-else class="mini-empty">這筆派送單目前還沒有派送紀錄。</p>
                 </div>
               </details>
 
@@ -1095,6 +1494,14 @@ function toMessage(error: unknown) {
                       <strong class="mono">{{ selectedNotification.dedupeKey }}</strong>
                     </div>
                     <div>
+                      <span class="field-label">Notification ID</span>
+                      <strong class="mono">{{ selectedNotification.notificationId }}</strong>
+                    </div>
+                    <div>
+                      <span class="field-label">Delivery ID</span>
+                      <strong class="mono">{{ selectedNotification.id }}</strong>
+                    </div>
+                    <div>
                       <span class="field-label">最後更新</span>
                       <strong>{{ formatDate(selectedNotification.updatedAt) }}</strong>
                     </div>
@@ -1103,14 +1510,13 @@ function toMessage(error: unknown) {
                   <div v-if="selectedHasMetadata" class="advanced-block">
                     <span class="field-label">Metadata JSON</span>
                     <pre>{{ selectedMetadata }}</pre>
-                    <p class="helper">目前 Telegram v1 不會依 metadata 自動套樣式。這塊主要保留給追蹤或未來擴充。</p>
                   </div>
                 </div>
               </details>
             </template>
 
             <div v-else class="empty-state">
-              <p>從左側選一筆通知，就能在這裡查看內容與執行操作。</p>
+              <p>從左側選一筆派送單，就能在這裡查看內容與執行操作。</p>
             </div>
           </section>
 
@@ -1118,7 +1524,6 @@ function toMessage(error: unknown) {
             <div class="panel__header">
               <div>
                 <h2>單筆建立通知</h2>
-                <p class="panel__hint">把常用欄位放在表面，進階欄位收起來，避免干擾。</p>
               </div>
               <button class="button button--ghost button--compact" @click="sidePanel = 'preview'">返回預覽</button>
             </div>
@@ -1135,18 +1540,26 @@ function toMessage(error: unknown) {
 
               <div class="two-up">
                 <label>
-                  <span>Target Chat ID</span>
-                  <input v-model="createForm.target" placeholder="1323447026 or -1001234567890" />
-                </label>
-                <label>
                   <span>排程時間</span>
                   <input v-model="createForm.scheduledAtLocal" type="datetime-local" required />
+                </label>
+                <label>
+                  <span>頻道</span>
+                  <input value="telegram" disabled />
                 </label>
               </div>
 
               <details class="foldout">
-                <summary>進階欄位</summary>
+                <summary>進階欄位與路由覆蓋</summary>
                 <div class="foldout__content stack">
+                  <label>
+                    <span>Target Override</span>
+                    <input
+                      v-model="createForm.target"
+                      placeholder="留空時，交由 NotifyCenter 的頻道對象設定決定實際派送對象"
+                    />
+                  </label>
+
                   <div class="two-up">
                     <label>
                       <span>Source System</span>
@@ -1172,7 +1585,9 @@ function toMessage(error: unknown) {
                     ></textarea>
                   </label>
 
-                  <p class="helper">Event Type 目前主要用來追蹤來源。Metadata 不會直接改變 Telegram v1 的訊息樣式，普通通知通常可以留空。</p>
+                  <p class="helper">
+                    Target Override 只會覆蓋這一筆通知需求。留空時，實際要送給誰完全由 NotifyCenter 的對象管理決定。
+                  </p>
                 </div>
               </details>
 
@@ -1184,7 +1599,6 @@ function toMessage(error: unknown) {
             <div class="panel__header">
               <div>
                 <h2>批次建立</h2>
-                <p class="panel__hint">適合匯入多筆通知。若不需要附加資訊，metadata 可以完全省略。</p>
               </div>
               <button class="button button--ghost button--compact" @click="sidePanel = 'preview'">返回預覽</button>
             </div>
@@ -1206,11 +1620,91 @@ function toMessage(error: unknown) {
             </article>
           </section>
 
+          <section v-else-if="sidePanel === 'targets'" class="panel targets-panel">
+            <div class="panel__header">
+              <div>
+                <h2>對象管理</h2>
+              </div>
+              <button class="button button--ghost button--compact" @click="resetRoutingTargetForm">清空表單</button>
+            </div>
+
+            <form class="stack" @submit.prevent="submitRoutingTarget">
+              <div class="two-up">
+                <label>
+                  <span>頻道</span>
+                  <select v-model="routingTargetForm.channel">
+                    <option v-for="option in routingChannelOptions" :key="option.value" :value="option.value">
+                      {{ option.label }}
+                    </option>
+                  </select>
+                </label>
+                <label>
+                  <span>顯示名稱</span>
+                  <input v-model="routingTargetForm.name" required />
+                </label>
+              </div>
+
+              <div class="two-up">
+                <label>
+                  <span>{{ routingDestinationLabel }}</span>
+                  <input v-model="routingTargetForm.destination" :placeholder="routingDestinationPlaceholder" required />
+                </label>
+                <label>
+                  <span>排序</span>
+                  <input v-model.number="routingTargetForm.sortOrder" type="number" />
+                </label>
+              </div>
+
+              <p v-if="routingTargetHint" class="helper">{{ routingTargetHint }}</p>
+
+              <label class="checkbox-field">
+                <input v-model="routingTargetForm.isEnabled" type="checkbox" />
+                <span>啟用這個對象</span>
+              </label>
+
+              <label>
+                <span>Metadata JSON</span>
+                <textarea
+                  v-model="routingTargetForm.metadataJson"
+                  rows="4"
+                  placeholder='例如：{"team":"ops","note":"future Teams webhook"}'
+                ></textarea>
+              </label>
+
+              <div class="panel__actions">
+                <button class="button button--primary" :disabled="saving">
+                  {{ routingTargetForm.id ? "更新對象" : "新增對象" }}
+                </button>
+                <button class="button button--ghost" type="button" @click="resetRoutingTargetForm">重設</button>
+              </div>
+            </form>
+
+            <div class="target-list">
+              <article v-for="item in routingTargets" :key="item.id" class="target-card">
+                <div class="target-card__head">
+                  <div>
+                    <strong>{{ item.name }}</strong>
+                    <p>{{ item.channel }} · sort {{ item.sortOrder }}</p>
+                  </div>
+                  <span class="badge" :class="item.isEnabled ? 'badge--sent' : 'badge--canceled'">
+                    {{ item.isEnabled ? "啟用中" : "已停用" }}
+                  </span>
+                </div>
+                <p class="target-card__destination mono">{{ item.destination }}</p>
+                <div class="target-card__actions">
+                  <button class="button button--ghost button--compact" @click="startEditingRoutingTarget(item)">編輯</button>
+                  <button class="button button--warning button--compact" @click="removeRoutingTarget(item.id)" :disabled="saving">
+                    刪除
+                  </button>
+                </div>
+              </article>
+            </div>
+          </section>
+
           <section v-else class="panel">
             <div class="panel__header">
               <div>
                 <h2>密碼設定</h2>
-                <p class="panel__hint">密碼至少需要 8 個字元。修改成功後，首次登入提醒就會消失。</p>
               </div>
               <button class="button button--ghost button--compact" @click="sidePanel = 'preview'">返回預覽</button>
             </div>
@@ -1249,30 +1743,30 @@ function toMessage(error: unknown) {
 .shell {
   position: relative;
   min-height: 100vh;
-  padding: 20px;
+  padding: 14px;
   overflow: hidden;
 }
 
 .shell__glow {
   position: absolute;
-  width: 26rem;
-  height: 26rem;
+  width: 24rem;
+  height: 24rem;
   border-radius: 50%;
   filter: blur(24px);
-  opacity: 0.42;
+  opacity: 0.38;
   pointer-events: none;
 }
 
 .shell__glow--top {
-  top: -11rem;
-  right: -8rem;
+  top: -10rem;
+  right: -7rem;
   background: rgba(255, 177, 91, 0.24);
 }
 
 .shell__glow--bottom {
   bottom: -11rem;
-  left: -9rem;
-  background: rgba(33, 101, 85, 0.14);
+  left: -8rem;
+  background: rgba(33, 101, 85, 0.12);
 }
 
 .login-card,
@@ -1284,17 +1778,17 @@ function toMessage(error: unknown) {
 .login-card {
   max-width: 32rem;
   margin: 8vh auto;
-  padding: 2rem;
+  padding: 1.8rem;
   border: 1px solid rgba(21, 27, 35, 0.12);
-  border-radius: 1.35rem;
-  background: rgba(255, 252, 245, 0.9);
-  box-shadow: 0 28px 80px rgba(40, 51, 62, 0.11);
+  border-radius: 1.2rem;
+  background: rgba(255, 252, 245, 0.92);
+  box-shadow: 0 24px 64px rgba(40, 51, 62, 0.11);
   backdrop-filter: blur(16px);
 }
 
 .workspace {
   display: grid;
-  gap: 0.85rem;
+  gap: 0.75rem;
 }
 
 .topbar,
@@ -1302,8 +1796,8 @@ function toMessage(error: unknown) {
 .summary-card,
 .panel {
   border: 1px solid rgba(21, 27, 35, 0.1);
-  background: rgba(255, 251, 244, 0.9);
-  box-shadow: 0 18px 36px rgba(28, 35, 43, 0.06);
+  background: rgba(255, 251, 244, 0.92);
+  box-shadow: 0 14px 30px rgba(28, 35, 43, 0.06);
   backdrop-filter: blur(12px);
 }
 
@@ -1311,9 +1805,9 @@ function toMessage(error: unknown) {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 1rem;
-  padding: 1.15rem 1.35rem;
-  border-radius: 1.35rem;
+  gap: 0.9rem;
+  padding: 1rem 1.15rem;
+  border-radius: 1.2rem;
 }
 
 .topbar__actions,
@@ -1322,25 +1816,25 @@ function toMessage(error: unknown) {
 .two-up,
 .bulk-bar,
 .bulk-bar__group,
-.filter-actions {
+.target-card__actions {
   display: flex;
-  gap: 0.6rem;
+  gap: 0.55rem;
 }
 
 .topbar__actions,
 .panel__actions,
 .bulk-bar,
 .bulk-bar__group,
-.filter-actions {
+.target-card__actions {
   flex-wrap: wrap;
 }
 
 .eyebrow {
-  margin: 0 0 0.25rem;
+  margin: 0 0 0.22rem;
   color: #8a5223;
   text-transform: uppercase;
   letter-spacing: 0.16em;
-  font-size: 0.76rem;
+  font-size: 0.74rem;
   font-weight: 700;
 }
 
@@ -1352,38 +1846,39 @@ p {
 }
 
 h1 {
-  font-size: clamp(1.75rem, 3vw, 2.35rem);
-  line-height: 1.06;
+  font-size: clamp(1.75rem, 3vw, 2.3rem);
+  line-height: 1.05;
 }
 
 h2 {
-  font-size: 1.08rem;
+  font-size: 1.04rem;
 }
 
 h3 {
-  font-size: 1rem;
+  font-size: 0.98rem;
 }
 
 .subtitle,
-.panel__hint,
 .helper,
 .hint,
-.selection-note--muted {
+.selection-note--muted,
+.queue-row__submeta,
+.target-card__head p {
   color: #5d6976;
 }
 
 .subtitle {
-  margin-top: 0.45rem;
-  max-width: 45rem;
+  margin-top: 0.4rem;
+  max-width: 48rem;
 }
 
 .warning-card {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 1rem;
-  padding: 0.85rem 1rem;
-  border-radius: 1.1rem;
+  gap: 0.9rem;
+  padding: 0.8rem 0.95rem;
+  border-radius: 1rem;
   background: linear-gradient(135deg, rgba(255, 196, 126, 0.22), rgba(255, 246, 230, 0.92));
 }
 
@@ -1397,12 +1892,12 @@ h3 {
 
 .status-stack {
   display: grid;
-  gap: 0.65rem;
+  gap: 0.55rem;
 }
 
 .message {
-  padding: 0.8rem 0.95rem;
-  border-radius: 0.95rem;
+  padding: 0.72rem 0.88rem;
+  border-radius: 0.9rem;
   border: 1px solid transparent;
 }
 
@@ -1420,15 +1915,15 @@ h3 {
 
 .summary-strip {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 0.7rem;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 0.65rem;
 }
 
 .summary-card {
   display: grid;
-  gap: 0.15rem;
-  padding: 0.8rem 0.9rem;
-  border-radius: 1rem;
+  gap: 0.1rem;
+  padding: 0.72rem 0.8rem;
+  border-radius: 0.95rem;
 }
 
 .summary-card--accent {
@@ -1437,61 +1932,63 @@ h3 {
 
 .summary-card span {
   color: #54616f;
-  font-size: 0.88rem;
+  font-size: 0.84rem;
 }
 
 .summary-card strong {
-  font-size: 1.55rem;
+  font-size: 1.36rem;
   line-height: 1;
 }
 
 .dashboard {
   display: grid;
-  grid-template-columns: minmax(0, 1.6fr) minmax(22rem, 0.95fr);
-  gap: 0.85rem;
+  grid-template-columns: minmax(0, 1.55fr) minmax(22rem, 0.95fr);
+  gap: 0.75rem;
   align-items: start;
 }
 
 .panel {
-  padding: 1rem;
-  border-radius: 1.25rem;
+  padding: 0.88rem;
+  border-radius: 1.15rem;
 }
 
-.queue-panel {
+.queue-panel,
+.preview-panel,
+.targets-panel {
   display: grid;
-  gap: 0.8rem;
+  gap: 0.72rem;
 }
 
 .side-stack {
   display: grid;
-  gap: 0.85rem;
+  gap: 0.75rem;
   position: sticky;
-  top: 1rem;
+  top: 0.9rem;
 }
 
 .panel__header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 0.75rem;
+  gap: 0.7rem;
 }
 
 .status-tabs {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.45rem;
+  gap: 0.42rem;
 }
 
 .status-tab {
   display: inline-flex;
   align-items: center;
-  gap: 0.4rem;
-  padding: 0.45rem 0.7rem;
+  gap: 0.35rem;
+  padding: 0.42rem 0.64rem;
   border: 1px solid rgba(21, 27, 35, 0.1);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.8);
   color: #23313d;
-  font-size: 0.92rem;
+  font-size: 0.88rem;
 }
 
 .status-tab strong {
@@ -1503,33 +2000,44 @@ h3 {
   border-color: rgba(31, 91, 76, 0.3);
 }
 
-.filter-grid {
+.filter-shell {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 0.65rem;
+  gap: 0.62rem;
+  padding: 0.72rem;
+  border: 1px solid rgba(21, 27, 35, 0.08);
+  border-radius: 1rem;
+  background: rgba(255, 255, 255, 0.52);
+}
+
+.filter-main,
+.filter-advanced {
+  display: grid;
+  gap: 0.62rem;
   align-items: end;
+}
+
+.filter-main {
+  grid-template-columns: minmax(10rem, 1fr) minmax(10rem, 1fr) minmax(9rem, 10rem) auto auto auto;
+}
+
+.filter-advanced {
+  grid-template-columns: repeat(3, minmax(0, 1fr)) minmax(0, 1.3fr) auto;
 }
 
 .field {
   display: grid;
-  gap: 0.28rem;
+  gap: 0.25rem;
 }
 
 .field span,
 label span {
   color: #445261;
-  font-size: 0.82rem;
+  font-size: 0.8rem;
   font-weight: 700;
 }
 
-.field--limit {
+.field--wide {
   min-width: 0;
-}
-
-.filter-actions {
-  align-items: flex-end;
-  justify-content: flex-end;
-  grid-column: 5 / span 2;
 }
 
 .stepper {
@@ -1537,7 +2045,7 @@ label span {
   grid-template-columns: minmax(0, 1fr) 2rem;
   overflow: hidden;
   border: 1px solid rgba(21, 27, 35, 0.14);
-  border-radius: 0.85rem;
+  border-radius: 0.8rem;
   background: rgba(255, 255, 255, 0.84);
 }
 
@@ -1567,15 +2075,15 @@ label span {
 .bulk-bar {
   align-items: center;
   justify-content: space-between;
-  padding: 0.55rem 0.75rem;
+  padding: 0.52rem 0.7rem;
   border: 1px solid rgba(21, 27, 35, 0.08);
-  border-radius: 0.95rem;
+  border-radius: 0.92rem;
   background: rgba(255, 255, 255, 0.62);
 }
 
 .selection-note {
   color: #2b3742;
-  font-size: 0.88rem;
+  font-size: 0.86rem;
   font-weight: 600;
 }
 
@@ -1588,27 +2096,27 @@ label span {
 
 .queue-table__head {
   display: grid;
-  grid-template-columns: 2.2rem minmax(0, 1.65fr) 8rem minmax(9rem, 1fr) 6rem;
-  gap: 0.75rem;
-  padding: 0.55rem 0.85rem;
+  grid-template-columns: 2.1rem minmax(0, 1.75fr) 7rem minmax(10rem, 1fr) 6rem;
+  gap: 0.65rem;
+  padding: 0.52rem 0.8rem;
   background: rgba(245, 248, 246, 0.96);
   color: #63707b;
-  font-size: 0.78rem;
+  font-size: 0.76rem;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
 
 .queue-list {
-  max-height: calc(100vh - 23rem);
+  max-height: calc(100vh - 22rem);
   overflow: auto;
 }
 
 .queue-row {
   display: grid;
-  grid-template-columns: 2.2rem minmax(0, 1fr);
-  gap: 0.75rem;
-  padding: 0.2rem 0.85rem;
+  grid-template-columns: 2.1rem minmax(0, 1fr);
+  gap: 0.65rem;
+  padding: 0.16rem 0.8rem;
   border-top: 1px solid rgba(21, 27, 35, 0.07);
 }
 
@@ -1628,10 +2136,10 @@ label span {
 
 .queue-row__button {
   display: grid;
-  grid-template-columns: minmax(0, 1.65fr) 8rem minmax(9rem, 1fr) 6rem;
-  gap: 0.75rem;
+  grid-template-columns: minmax(0, 1.75fr) 7rem minmax(10rem, 1fr) 6rem;
+  gap: 0.65rem;
   align-items: center;
-  padding: 0.65rem 0;
+  padding: 0.56rem 0;
   border: 0;
   background: transparent;
   text-align: left;
@@ -1643,26 +2151,39 @@ label span {
 
 .queue-row__title strong {
   display: block;
-  font-size: 0.98rem;
+  font-size: 0.96rem;
 }
 
 .queue-row__title p {
-  color: #53616e;
-  font-size: 0.88rem;
+  font-size: 0.86rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.queue-row__submeta {
+  margin-top: 0.12rem;
+}
+
 .queue-row__error {
   color: #a13c2f;
-  margin-top: 0.16rem;
+  margin-top: 0.14rem;
 }
 
 .queue-row__meta,
 .queue-row__status {
   color: #42515e;
-  font-size: 0.88rem;
+  font-size: 0.86rem;
+}
+
+.queue-row__meta strong,
+.queue-row__meta small {
+  display: block;
+}
+
+.queue-row__meta small {
+  color: #5d6976;
+  margin-top: 0.12rem;
 }
 
 .queue-row__status {
@@ -1670,34 +2191,29 @@ label span {
   justify-content: flex-end;
 }
 
-.preview-panel {
-  display: grid;
-  gap: 0.8rem;
-}
-
 .preview-strip {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.45rem;
+  gap: 0.42rem;
   align-items: center;
 }
 
 .mini-chip {
   display: inline-flex;
   align-items: center;
-  padding: 0.28rem 0.55rem;
+  padding: 0.26rem 0.52rem;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.8);
   border: 1px solid rgba(21, 27, 35, 0.08);
   color: #394652;
-  font-size: 0.82rem;
+  font-size: 0.8rem;
 }
 
 .message-preview {
   display: grid;
-  gap: 0.45rem;
-  padding: 0.9rem 1rem;
-  border-radius: 1rem;
+  gap: 0.4rem;
+  padding: 0.82rem 0.92rem;
+  border-radius: 0.95rem;
   background: linear-gradient(135deg, rgba(255, 255, 255, 0.96), rgba(240, 248, 244, 0.94));
   border: 1px solid rgba(31, 91, 76, 0.12);
 }
@@ -1709,15 +2225,20 @@ label span {
 .badge {
   display: inline-flex;
   align-items: center;
-  padding: 0.26rem 0.55rem;
+  padding: 0.24rem 0.52rem;
   border-radius: 999px;
-  font-size: 0.76rem;
+  font-size: 0.74rem;
   font-weight: 700;
 }
 
 .badge--pending {
   background: rgba(255, 215, 130, 0.35);
   color: #7d5204;
+}
+
+.badge--pending_no_target {
+  background: rgba(147, 191, 214, 0.28);
+  color: #24526d;
 }
 
 .badge--sent {
@@ -1735,6 +2256,11 @@ label span {
   color: #41505d;
 }
 
+.badge--skipped_no_target {
+  background: rgba(199, 184, 137, 0.28);
+  color: #725d1f;
+}
+
 .foldout {
   border: 1px solid rgba(21, 27, 35, 0.1);
   border-radius: 1rem;
@@ -1747,34 +2273,34 @@ label span {
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  padding: 0.75rem 0.9rem;
+  padding: 0.72rem 0.86rem;
   font-weight: 700;
   cursor: pointer;
 }
 
 .foldout__content {
-  padding: 0 0.9rem 0.9rem;
+  padding: 0 0.86rem 0.86rem;
 }
 
 .advanced-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.75rem;
+  gap: 0.7rem;
 }
 
 .field-label {
   display: block;
-  margin-bottom: 0.22rem;
+  margin-bottom: 0.2rem;
   color: #687684;
-  font-size: 0.76rem;
+  font-size: 0.74rem;
   text-transform: uppercase;
   letter-spacing: 0.08em;
 }
 
 .advanced-block {
-  margin-top: 0.85rem;
-  padding: 0.9rem;
-  border-radius: 0.95rem;
+  margin-top: 0.82rem;
+  padding: 0.86rem;
+  border-radius: 0.92rem;
   background: rgba(16, 23, 31, 0.94);
   color: #f3f7fb;
 }
@@ -1799,26 +2325,36 @@ table {
 
 th,
 td {
-  padding: 0.65rem 0.45rem;
+  padding: 0.62rem 0.42rem;
   border-bottom: 1px solid rgba(21, 27, 35, 0.1);
   text-align: left;
   vertical-align: top;
-  font-size: 0.88rem;
+  font-size: 0.86rem;
 }
 
 .stack,
 label {
   display: grid;
-  gap: 0.5rem;
+  gap: 0.45rem;
+}
+
+.checkbox-field {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.checkbox-field input {
+  width: auto;
 }
 
 input,
 select,
 textarea {
   width: 100%;
-  padding: 0.68rem 0.8rem;
+  padding: 0.62rem 0.75rem;
   border: 1px solid rgba(21, 27, 35, 0.14);
-  border-radius: 0.85rem;
+  border-radius: 0.82rem;
   background: rgba(255, 255, 255, 0.84);
   color: #151b23;
 }
@@ -1831,8 +2367,8 @@ textarea {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 2.4rem;
-  padding: 0.65rem 0.95rem;
+  min-height: 2.24rem;
+  padding: 0.6rem 0.9rem;
   border: 1px solid rgba(21, 27, 35, 0.12);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.8);
@@ -1840,9 +2376,9 @@ textarea {
 }
 
 .button--compact {
-  min-height: 2rem;
-  padding: 0.45rem 0.8rem;
-  font-size: 0.88rem;
+  min-height: 1.95rem;
+  padding: 0.42rem 0.76rem;
+  font-size: 0.86rem;
 }
 
 .button:disabled {
@@ -1886,9 +2422,9 @@ textarea {
 
 .result-card {
   display: grid;
-  gap: 0.75rem;
-  padding: 0.95rem;
-  border-radius: 1rem;
+  gap: 0.72rem;
+  padding: 0.9rem;
+  border-radius: 0.96rem;
   background: rgba(18, 27, 35, 0.95);
   color: #f3f7fb;
 }
@@ -1897,7 +2433,32 @@ textarea {
   display: flex;
   flex-wrap: wrap;
   justify-content: space-between;
-  gap: 0.75rem;
+  gap: 0.72rem;
+}
+
+.target-list {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.target-card {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.8rem;
+  border: 1px solid rgba(21, 27, 35, 0.08);
+  border-radius: 0.94rem;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.target-card__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.7rem;
+}
+
+.target-card__destination {
+  color: #23313d;
 }
 
 .mono {
@@ -1910,14 +2471,17 @@ code {
   background: rgba(21, 27, 35, 0.08);
 }
 
-@media (max-width: 1440px) {
-  .filter-grid {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+@media (max-width: 1520px) {
+  .filter-main {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
-  .filter-actions {
-    grid-column: 1 / -1;
-    justify-content: flex-start;
+  .filter-advanced {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .summary-strip {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
 
@@ -1928,10 +2492,6 @@ code {
 
   .side-stack {
     position: static;
-  }
-
-  .summary-strip {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
 
@@ -1951,17 +2511,21 @@ code {
 
   .queue-check {
     justify-content: flex-start;
-    padding-top: 0.45rem;
+    padding-top: 0.4rem;
   }
 
   .queue-row__status {
     justify-content: flex-start;
   }
+
+  .advanced-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 760px) {
   .shell {
-    padding: 14px;
+    padding: 12px;
   }
 
   .topbar,
@@ -1971,23 +2535,18 @@ code {
   .panel__actions,
   .two-up,
   .action-row,
-  .advanced-grid,
   .result-card__summary,
   .bulk-bar,
-  .bulk-bar__group {
+  .bulk-bar__group,
+  .target-card__head,
+  .target-card__actions {
     display: grid;
   }
 
-  .summary-strip {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .filter-grid {
+  .summary-strip,
+  .filter-main,
+  .filter-advanced {
     grid-template-columns: 1fr;
-  }
-
-  .filter-actions {
-    grid-column: auto;
   }
 }
 </style>

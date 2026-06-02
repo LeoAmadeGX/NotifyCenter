@@ -6,11 +6,18 @@ import type {
   NotificationCreateInput,
   NotificationFilters,
   NotificationItem,
-  NotificationStats
+  RoutingTargetInput,
+  RoutingTargetItem,
+  NotificationStats,
+  UpsertResult
 } from "./types";
 
+const apiBase = import.meta.env.BASE_URL.replace(/\/$/, "")
+
+export const adminEventsUrl = `${apiBase}/api/admin/events`
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(apiBase + path, {
     credentials: "include",
     headers: {
       "Content-Type": "application/json",
@@ -65,6 +72,7 @@ export function getNotifications(filters: NotificationFilters) {
   if (filters.channel) params.set("channel", filters.channel);
   if (filters.sourceSystem) params.set("sourceSystem", filters.sourceSystem);
   if (filters.eventType) params.set("eventType", filters.eventType);
+  if (filters.messageQuery) params.set("messageQuery", filters.messageQuery);
   if (filters.scheduledFrom) params.set("scheduledFromUtc", new Date(filters.scheduledFrom).toISOString());
   if (filters.scheduledTo) params.set("scheduledToUtc", new Date(filters.scheduledTo).toISOString());
   params.set("limit", String(filters.limit));
@@ -88,7 +96,7 @@ export function getStats() {
 }
 
 export function createNotification(input: NotificationCreateInput) {
-  return request("/api/notifications", {
+  return request<UpsertResult>("/api/notifications", {
     method: "POST",
     body: JSON.stringify(input)
   });
@@ -106,5 +114,31 @@ export function cancelNotification(id: string) {
 }
 
 export function retryNotification(id: string) {
-  return request<{ queued: boolean }>(`/api/notifications/${id}/retry`, { method: "POST" });
+  return request<{ queued: boolean; skipped: boolean; status: string }>(`/api/notifications/${id}/retry`, {
+    method: "POST"
+  });
+}
+
+export function getRoutingTargets() {
+  return request<{ items: RoutingTargetItem[] }>("/api/routing-targets");
+}
+
+export function createRoutingTarget(input: RoutingTargetInput) {
+  return request<RoutingTargetItem>("/api/routing-targets", {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+}
+
+export function updateRoutingTarget(id: string, input: RoutingTargetInput) {
+  return request<RoutingTargetItem>(`/api/routing-targets/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(input)
+  });
+}
+
+export function deleteRoutingTarget(id: string) {
+  return request<void>(`/api/routing-targets/${id}`, {
+    method: "DELETE"
+  });
 }
