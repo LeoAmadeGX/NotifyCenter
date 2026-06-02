@@ -2,11 +2,11 @@ using NotifyCenter.Api.Models;
 
 namespace NotifyCenter.Api.Services;
 
-public sealed class NotificationSenderRegistry(TelegramSender telegramSender)
+public sealed class NotificationSenderRegistry(TelegramSender telegramSender, LineSender lineSender)
 {
     public bool IsSupported(string channel)
     {
-        return string.Equals(channel, "telegram", StringComparison.OrdinalIgnoreCase);
+        return Normalize(channel) is "telegram" or "line";
     }
 
     public Task<NotificationSendResult> SendAsync(NotificationItem delivery, CancellationToken cancellationToken)
@@ -14,6 +14,7 @@ public sealed class NotificationSenderRegistry(TelegramSender telegramSender)
         return Normalize(delivery.Channel) switch
         {
             "telegram" => telegramSender.SendAsync(delivery, cancellationToken),
+            "line" => lineSender.SendAsync(delivery, cancellationToken),
             _ => throw new UnsupportedNotificationChannelException(delivery.Channel)
         };
     }

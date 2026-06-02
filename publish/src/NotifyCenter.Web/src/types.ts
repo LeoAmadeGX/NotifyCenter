@@ -94,6 +94,23 @@ export interface NotificationCreateInput {
   metadata?: Record<string, unknown> | null;
 }
 
+export interface LineSourceItem {
+  id: string;
+  sourceType: string;
+  sourceId: string;
+  displayName: string | null;
+  pictureUrl: string | null;
+  statusMessage: string | null;
+  lastEventType: string | null;
+  lastEventAtUtc: string | null;
+  firstSeenAtUtc: string;
+  updatedAt: string;
+  metadataJson: string;
+  routingTargetId: string | null;
+  routingTargetName: string | null;
+  routingTargetEnabled: boolean | null;
+}
+
 export interface RoutingTargetItem {
   id: string;
   channel: string;

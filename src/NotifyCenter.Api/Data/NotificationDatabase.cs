@@ -91,6 +91,27 @@ public sealed class NotificationDatabase(NpgsqlDataSource dataSource, ILogger<No
             CREATE INDEX IF NOT EXISTS ix_notification_deliveries_channel_status
                 ON notification_deliveries (channel, status, scheduled_at_utc);
 
+            CREATE TABLE IF NOT EXISTS notification_line_sources (
+                id uuid PRIMARY KEY,
+                source_type text NOT NULL,
+                source_id text NOT NULL,
+                display_name text NULL,
+                picture_url text NULL,
+                status_message text NULL,
+                last_event_type text NULL,
+                last_event_at_utc timestamptz NULL,
+                first_seen_at_utc timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now(),
+                metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+                CONSTRAINT ux_notification_line_sources_type_id UNIQUE (source_type, source_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS ix_notification_line_sources_updated
+                ON notification_line_sources (updated_at DESC);
+
+            CREATE INDEX IF NOT EXISTS ix_notification_line_sources_type_updated
+                ON notification_line_sources (source_type, updated_at DESC);
+
             CREATE TABLE IF NOT EXISTS admin_users (
                 id uuid PRIMARY KEY,
                 username text NOT NULL UNIQUE,
