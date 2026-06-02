@@ -7,11 +7,11 @@ namespace NotifyCenter.Api.Services;
 
 public sealed class TelegramSender(HttpClient httpClient, AppOptions options)
 {
-    public async Task<NotificationSendResult> SendAsync(NotificationItem item, CancellationToken cancellationToken)
+    public async Task<NotificationSendResult> SendAsync(NotificationItem delivery, CancellationToken cancellationToken)
     {
-        if (!string.Equals(item.Channel, "telegram", StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(delivery.Channel, "telegram", StringComparison.OrdinalIgnoreCase))
         {
-            throw new UnsupportedNotificationChannelException(item.Channel);
+            throw new UnsupportedNotificationChannelException(delivery.Channel);
         }
 
         if (string.IsNullOrWhiteSpace(options.Telegram.BotToken))
@@ -19,15 +19,15 @@ public sealed class TelegramSender(HttpClient httpClient, AppOptions options)
             throw new InvalidOperationException("TELEGRAM_BOT_TOKEN is required to send Telegram notifications");
         }
 
-        if (string.IsNullOrWhiteSpace(item.Target))
+        if (string.IsNullOrWhiteSpace(delivery.Target))
         {
             throw new InvalidOperationException("Telegram target chat id is required");
         }
 
         var payload = new Dictionary<string, object?>
         {
-            ["chat_id"] = item.Target,
-            ["text"] = $"{item.Title}\n\n{item.Body}",
+            ["chat_id"] = delivery.Target,
+            ["text"] = $"{delivery.Title}\n\n{delivery.Body}",
             ["disable_web_page_preview"] = true
         };
 
